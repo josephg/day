@@ -157,13 +157,17 @@ fn make(_backend: &mut Gtk, p: &WebProps, id: NodeId) -> gtk4::Widget {
                 _ => None,
             };
             let Some(uri) = uri else { return false };
-            let b = base.borrow();
-            let inside = uri == "about:blank"
-                || (!b.is_empty()
-                    && (uri == *b
-                        || uri
-                            .strip_prefix(b.as_str())
-                            .is_some_and(|rest| rest.starts_with('#'))));
+            // The borrow ends before `emit`: the app may answer the event synchronously
+            // with a new LoadHtml patch, whose `update` writes this same cell.
+            let inside = {
+                let b = base.borrow();
+                uri == "about:blank"
+                    || (!b.is_empty()
+                        && (uri == *b
+                            || uri
+                                .strip_prefix(b.as_str())
+                                .is_some_and(|rest| rest.starts_with('#'))))
+            };
             if inside && dtype == PolicyDecisionType::NavigationAction {
                 return false;
             }
