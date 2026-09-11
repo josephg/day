@@ -197,6 +197,20 @@ directions, a window resize reflows and re-measures them, and the wheel scrolls 
 (the fling is written to GTK's documented velocity units — pixels per ms — and not yet
 exercised on a touchpad; the reference box has none).
 
+**Fit width (phones).** `.fit_width()` on a fit-content view (UIKit only; the other arms
+ignore it): a document wider than the leaf — a newsletter table with a 600 px minimum — is
+laid out at its own width and zoomed out to fit, WebKit's own scaling through a rewritten
+viewport meta (`width=<natural>`, `initial-scale` and `minimum-scale` at the fit scale,
+`maximum-scale=3`), so the text stays crisp and a pinch zooms back in to three times
+natural, as the Fastmail mobile client's `PanZoomView` does. The reporter posts the height
+MULTIPLIED by the visual viewport's scale, so the leaf is as tall as the scaled page whether
+zoomed out to fit or pinched in — an enclosing column grows with the zoom and keeps the
+vertical gesture — and a second field says whether the user is zoomed in past the fit
+scale: while they are, the view's own scroll view is enabled so the page pans sideways
+(never bouncing, so a pan it cannot absorb goes to the enclosing scroll); at the fit scale
+it is off again. The layout width only grows (an image landing can widen the page), so the
+rewrite cannot loop; a narrow document is untouched.
+
 Gate on `fit_support()`: it rides the script-message channel, so today it is GTK. Elsewhere
 the view fills its space and scrolls itself, which is the honest fallback. The mode is meant
 for documents an app renders (a message body), not for arbitrary sites, whose `100vh`

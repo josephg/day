@@ -78,22 +78,54 @@ const FIT_WORLD: &str = "day-fit";
 /// box, NOT `scrollHeight`, which is clamped to the viewport and would never let the view
 /// shrink — whenever it changes: after the load, as images land, when a width change reflows
 /// the text. The same reporter as the GTK arm's.
+///
+/// With `fit_width` (`__FIT_WIDTH__` is `true`), the reporter also FITS a wide document:
+/// when the content is wider than the layout viewport it rewrites the viewport meta to lay
+/// the page out at its natural width, zoomed out to fit the leaf — WebKit's own scaling, so
+/// the text stays crisp and a pinch zooms back in (to three times natural) — and reports the
+/// height MULTIPLIED by the visual viewport's scale, so the leaf is as tall as the scaled
+/// page, whether zoomed out to fit or pinched in. A second field says whether the user is
+/// zoomed in past the fit scale: while they are, the view pans sideways itself. The layout
+/// width only ever grows (an image landing can widen the page), so the rewrite cannot loop.
 const FIT_SCRIPT: &str = r#"(function(){
 if (window.__dayFit) return; window.__dayFit = true;
+var fitWidth = __FIT_WIDTH__;
 var st = document.createElement('style');
 st.textContent = 'html{overflow:hidden!important;height:auto!important}';
 (document.head || document.documentElement).appendChild(st);
-var last = -1;
-function post() {
+var vv = window.visualViewport;
+var layoutW = 0, fitScale = 1, last = '';
+function scale() { return vv ? vv.scale : 1; }
+function natural() {
   var d = document.documentElement, b = document.body;
+  var w = Math.max(d.scrollWidth, b ? b.scrollWidth : 0);
+  if (b) for (var i = 0; i < b.children.length; i++) w = Math.max(w, b.children[i].scrollWidth);
+  return w;
+}
+function fit() {
+  if (!fitWidth) return;
+  var d = document.documentElement, w = natural(), vw = d.clientWidth;
+  if (w <= vw + 1 || w <= layoutW) return;
+  var framePx = window.innerWidth * scale();
+  layoutW = w;
+  fitScale = Math.max(0.25, Math.min(1, framePx / w));
+  var m = document.querySelector('meta[name=viewport]');
+  if (!m) { m = document.createElement('meta'); m.name = 'viewport'; (document.head || d).appendChild(m); }
+  m.content = 'width=' + w + ', initial-scale=' + fitScale + ', minimum-scale=' + fitScale + ', maximum-scale=3';
+}
+function post() {
+  fit();
+  var d = document.documentElement, b = document.body, s = scale();
   var h = Math.ceil(d.getBoundingClientRect().height);
   if (b) h = Math.max(h, Math.ceil(b.getBoundingClientRect().height + b.offsetTop));
-  if (h !== last) { last = h; window.webkit.messageHandlers.dayFit.postMessage(h); }
+  var msg = Math.ceil(h * s) + ',' + (s > fitScale + 0.01 ? 1 : 0);
+  if (msg !== last) { last = msg; window.webkit.messageHandlers.dayFit.postMessage(msg); }
 }
 var ro = new ResizeObserver(post);
 ro.observe(document.documentElement);
 if (document.body) ro.observe(document.body);
 window.addEventListener('load', post);
+if (vv && fitWidth) vv.addEventListener('resize', post);
 post();
 })();"#;
 
@@ -120,6 +152,10 @@ struct NavIvars {
     /// view). What `measure` answers with; the app's estimate (floored at [`FIT_MIN`]) until
     /// the first report.
     fit: Cell<Option<f64>>,
+    /// Fit-width mode: whether the user is pinched in past the fit scale — while they are,
+    /// the view's own scroll view pans the zoomed page sideways; at the fit scale it is off
+    /// so the enclosing native scroll owns every gesture.
+    zoomed: Cell<bool>,
 }
 
 /// WKNavigationActionPolicy, hand-rolled like the class itself: Cancel = 0, Allow = 1.
@@ -195,11 +231,24 @@ define_class!(
                 // Only the reporter can post here (the handler lives in its world), but the
                 // value is still a measure of untrusted content: a non-finite number would
                 // loop layout, an absurd one would give it a mile-high leaf.
-                let Ok(h) = text.trim().parse::<f64>() else {
+                // `height` or `height,zoomed` (fit-width mode).
+                let mut parts = text.trim().split(',');
+                let Some(Ok(h)) = parts.next().map(str::trim).map(str::parse::<f64>) else {
                     return;
                 };
                 if !h.is_finite() {
                     return;
+                }
+                let zoomed = parts.next().is_some_and(|z| z.trim() == "1");
+                if zoomed != self.ivars().zoomed.get() {
+                    self.ivars().zoomed.set(zoomed);
+                    let web: *mut AnyObject = unsafe { msg_send![message, webView] };
+                    if !web.is_null() {
+                        unsafe {
+                            let sv: Retained<AnyObject> = msg_send![&*web, scrollView];
+                            let _: () = msg_send![&*sv, setScrollEnabled: zoomed];
+                        }
+                    }
                 }
                 let h = h.clamp(FIT_MIN, FIT_MAX);
                 if self.ivars().fit.get() == Some(h) {
@@ -253,6 +302,7 @@ impl WebNav {
             node: Cell::new(node),
             inline_base: RefCell::new(None),
             fit: Cell::new(fit),
+            zoomed: Cell::new(false),
         });
         unsafe { msg_send![super(this), init] }
     }
@@ -271,13 +321,14 @@ fn process_pool() -> Retained<WKProcessPool> {
 
 /// Fit-content mode (docs/webview.md): the reporter and its handler in the isolated world,
 /// and the view's own scrolling off so the enclosing native scroll owns the gesture.
-fn install_fit(web: &WKWebView, ucc: &WKUserContentController, nav: &WebNav) {
+fn install_fit(web: &WKWebView, ucc: &WKUserContentController, nav: &WebNav, fit_width: bool) {
+    let source = FIT_SCRIPT.replace("__FIT_WIDTH__", if fit_width { "true" } else { "false" });
     unsafe {
         let world: Retained<WKContentWorld> =
             msg_send![class!(WKContentWorld), worldWithName: &*NSString::from_str(FIT_WORLD)];
         let script: Retained<WKUserScript> = msg_send![
             WKUserScript::alloc(),
-            initWithSource: &*NSString::from_str(FIT_SCRIPT),
+            initWithSource: &*NSString::from_str(&source),
             injectionTime: INJECT_AT_DOCUMENT_END,
             forMainFrameOnly: true,
             inContentWorld: &*world
@@ -289,9 +340,15 @@ fn install_fit(web: &WKWebView, ucc: &WKUserContentController, nav: &WebNav) {
             contentWorld: &*world,
             name: &*NSString::from_str(FIT_HANDLER)
         ];
+        // Scrolling off at the fit scale (the pinch still works: it is the scroll view's own
+        // zoom gesture, which `scrollEnabled` does not govern) and back on while zoomed in,
+        // from the reporter's `zoomed` flag; never a bounce, so a pan the zoomed page cannot
+        // absorb goes to the enclosing scroll.
         let sv: Retained<AnyObject> = msg_send![web, scrollView];
         let _: () = msg_send![&*sv, setScrollEnabled: false];
         let _: () = msg_send![&*sv, setBounces: false];
+        let _: () = msg_send![&*sv, setAlwaysBounceVertical: false];
+        let _: () = msg_send![&*sv, setAlwaysBounceHorizontal: false];
     }
 }
 
@@ -399,7 +456,7 @@ fn make(_backend: &mut Uikit, p: &WebProps, id: NodeId) -> Retained<UIView> {
         };
     }
     if p.fit {
-        install_fit(&web, &ucc, &nav);
+        install_fit(&web, &ucc, &nav, p.fit_width);
     }
     if !p.inline_root.is_empty() {
         // Inline mode (docs/webview.md): the assets tree is loose files in the app bundle, so

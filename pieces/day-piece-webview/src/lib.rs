@@ -63,6 +63,10 @@ pub struct WebProps {
     /// Fit-content mode: the height the leaf has until the document's first report
     /// ([`WebView::estimated_height`]); `0` = the arm's floor (one line).
     pub fit_estimate: f64,
+    /// Fit-content mode, phones ([`WebView::fit_width`]): a document wider than the leaf is
+    /// scaled down to fit it, and the user may pinch in; the reported height follows the
+    /// scale. Ignored by arms without the mode.
+    pub fit_width: bool,
 }
 
 /// A retained browsing session — the thing that outlives the view showing it.
@@ -703,6 +707,7 @@ pub struct WebView {
     base_url: String,
     fit: bool,
     fit_estimate: f64,
+    fit_width: bool,
 }
 
 /// `web_view(url)` — a native web view showing `url`. The initial value loads on creation; call
@@ -732,6 +737,7 @@ pub fn web_view(url: Signal<String>) -> WebView {
         base_url: String::new(),
         fit: false,
         fit_estimate: 0.0,
+        fit_width: false,
     }
 }
 
@@ -785,6 +791,18 @@ impl WebView {
     /// Clamped to the arm's range; ignored outside fit-content mode.
     pub fn estimated_height(mut self, height: f64) -> Self {
         self.fit_estimate = height.max(0.0);
+        self
+    }
+
+    /// Fit-content mode on a phone (docs/webview.md § Fit-content documents): a document
+    /// wider than the leaf — a fixed-width newsletter table — is laid out at its own width
+    /// and scaled down to fit, the way the Fastmail mobile client's message view opens
+    /// zoomed out, and the user may pinch in to read it (to three times its natural size);
+    /// the reported height follows the scale, so an enclosing column grows with the zoom and
+    /// keeps owning the vertical gesture while the view pans sideways. UIKit only; the other
+    /// arms ignore it (a desktop shows a scrollbar instead).
+    pub fn fit_width(mut self) -> Self {
+        self.fit_width = true;
         self
     }
 }
@@ -927,11 +945,13 @@ impl Piece for WebView {
             base_url,
             fit,
             fit_estimate,
+            fit_width,
         } = self;
         let initial = WebProps {
             messages: on_message.is_some(),
             fit,
             fit_estimate,
+            fit_width,
             url: url.get_untracked(),
             session: session.map(WebSession::id).unwrap_or(0),
             inline_root: inline.as_ref().map(|s| s.root.clone()).unwrap_or_default(),
@@ -1079,6 +1099,7 @@ pub trait WebViewBuilder: Sized {
     fn on_message(self, f: impl Fn(&str) + 'static) -> Self;
     fn fit_content(self) -> Self;
     fn estimated_height(self, height: f64) -> Self;
+    fn fit_width(self) -> Self;
 }
 
 impl WebViewBuilder for WebView {
@@ -1117,6 +1138,9 @@ impl WebViewBuilder for WebView {
     }
     fn estimated_height(self, height: f64) -> Self {
         WebView::estimated_height(self, height)
+    }
+    fn fit_width(self) -> Self {
+        WebView::fit_width(self)
     }
 }
 
@@ -1158,6 +1182,9 @@ impl<Inner: WebViewBuilder + day_pieces::prelude::Piece> WebViewBuilder
     }
     fn estimated_height(self, height: f64) -> Self {
         self.map_inner(|inner_piece| inner_piece.estimated_height(height))
+    }
+    fn fit_width(self) -> Self {
+        self.map_inner(|inner_piece| inner_piece.fit_width())
     }
 }
 
