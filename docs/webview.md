@@ -179,7 +179,7 @@ plain text or preview gives a line count, and a card that was open before has it
 measured height, either of which opens it at about its final size). A `LoadHtml` that
 replaces the document keeps the current height until the new document reports its own (a
 re-render of the same message — images allowed, a theme switch — lands at the same height
-or near it); only a terminated web process drops a view to the floor.
+or near it); only a terminated web process drops a view back to its estimate.
 
 Wheel and touchpad scrolling over the view: a **vertical** delta is captured by the piece and
 forwarded to the nearest *real* `GtkScrolledWindow` above it (a wheel click moves
@@ -226,9 +226,9 @@ process. (GTK has no `WebSession` arm today — `.session(..)` is ignored there,
 § Sessions — so nothing observes this yet.) And **one process is one fate**: a runaway
 script or a crash in any document takes every view's page down with it (WebKit shows them
 blank). The GTK arm handles `web-process-terminated` by logging the reason and, for a
-fit-content view, dropping its height back to the floor so a column does not keep a dead
-document's space; the app's next `LoadHtml` (a re-render, a reopened message) starts a
-fresh process. The other arms leave the signal unhandled.
+fit-content view, dropping its height back to the app's estimate (the floor without one) so
+a column does not keep a dead document's space; the app's next `LoadHtml` (a re-render, a
+reopened message) starts a fresh process. The other arms leave the signal unhandled.
 
 ## Inline sites: `web_view_inline` (app-embedded content)
 

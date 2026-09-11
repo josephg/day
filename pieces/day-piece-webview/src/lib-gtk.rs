@@ -158,16 +158,14 @@ fn make(_backend: &mut Gtk, p: &WebProps, id: NodeId) -> gtk4::Widget {
         .user_content_manager(&ucm)
         .related_view(&anchor)
         .build();
+    // The app's estimate (`estimated_height`) opens a fit view at about its final size; the
+    // floor when it gave none.
+    let fit_estimate = p.fit_estimate.clamp(FIT_MIN, FIT_MAX);
     let state = Rc::new(ViewState {
         node: id,
         base: RefCell::new(p.base_url.clone()),
-        // The app's estimate (`estimated_height`) opens the view at about its final size;
-        // the floor when it gave none.
-        fit: Cell::new(if p.fit {
-            Some(p.fit_estimate.clamp(FIT_MIN, FIT_MAX))
-        } else {
-            None
-        }),
+        fit: Cell::new(p.fit.then_some(fit_estimate)),
+        fit_estimate,
         fling: Cell::new(None),
     });
     VIEWS.with(|m| m.borrow_mut().insert(widget_key(&wv), state.clone()));
@@ -182,8 +180,9 @@ fn make(_backend: &mut Gtk, p: &WebProps, id: NodeId) -> gtk4::Widget {
     });
     // The shared process is also a shared fate: one document's runaway script or crash
     // takes every view's page with it (WebKit shows them blank). Say so, and let a fit view
-    // give its height back rather than hold a dead document's — the app's next LoadHtml
-    // (a re-render, a reopened message) starts a fresh process.
+    // give a dead document's height back — down to the app's estimate, the best guess for
+    // what the next LoadHtml (a re-render, a reopened message; it starts a fresh process)
+    // will measure, as at creation.
     let st = state.clone();
     wv.connect_web_process_terminated(move |_wv, reason| {
         log::warn!(
@@ -191,9 +190,9 @@ fn make(_backend: &mut Gtk, p: &WebProps, id: NodeId) -> gtk4::Widget {
              every view shares it (docs/webview.md § Processes)",
             st.node
         );
-        if st.fit.get().is_some() {
-            st.fit.set(Some(FIT_MIN));
-            day_gtk::emit(st.node, Report::Fit.event(FIT_MIN.to_string()));
+        if st.fit.get().is_some_and(|h| h != st.fit_estimate) {
+            st.fit.set(Some(st.fit_estimate));
+            day_gtk::emit(st.node, Report::Fit.event(st.fit_estimate.to_string()));
         }
     });
     // Report the current URL back on every navigation so a bound text field follows.
@@ -312,8 +311,12 @@ struct ViewState {
     /// closure sees the move.
     base: RefCell<String>,
     /// Fit-content mode: the document's last reported height in points (`None` = a
-    /// filling view). What `measure` answers with; [`FIT_MIN`] until the first report.
+    /// filling view). What `measure` answers with; the estimate until the first report.
     fit: Cell<Option<f64>>,
+    /// Fit-content mode: the app's `estimated_height`, clamped to the fit range ([`FIT_MIN`]
+    /// when it gave none) — what the view opens at, and falls back to when its web process
+    /// dies.
+    fit_estimate: f64,
     /// Fit-content mode: the running kinetic-scroll ramp on the outer scroll, if any, so a
     /// new touch stops it.
     fling: Cell<Option<gtk4::glib::SourceId>>,
