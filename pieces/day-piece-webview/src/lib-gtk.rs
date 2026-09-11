@@ -119,8 +119,24 @@ fn make(_backend: &mut Gtk, p: &WebProps, id: NodeId) -> gtk4::Widget {
             },
         );
     });
+    // One web process for every view this piece creates (docs/webview.md § Processes):
+    // WebKitGTK 6 gives each new WebView its own WebKitWebProcess unless it is created
+    // `related` to one that already has a process, so a conversation of ten documents
+    // would be ten processes. The anchor is a view that is never shown and never freed;
+    // relating every view to it puts them all in the anchor's process, which also stays
+    // warm between conversations (the first page of a fresh process is the slow one).
+    let anchor = ANCHOR.with(|a| {
+        a.borrow_mut()
+            .get_or_insert_with(|| {
+                let a = webkit6::WebView::new();
+                a.load_html("<!doctype html><title>day</title>", None);
+                a
+            })
+            .clone()
+    });
     let wv = webkit6::WebView::builder()
         .user_content_manager(&ucm)
+        .related_view(&anchor)
         .build();
     let state = Rc::new(ViewState {
         node: id,
@@ -379,6 +395,8 @@ fn measure(_backend: &mut Gtk, h: &gtk4::Widget, p: day_spec::Proposal) -> day_s
 
 thread_local! {
     static VIEWS: RefCell<HashMap<usize, Rc<ViewState>>> = RefCell::new(HashMap::new());
+    /// The process anchor every view is created `related` to (see `make`).
+    static ANCHOR: RefCell<Option<webkit6::WebView>> = const { RefCell::new(None) };
 }
 
 /// A posted script message as text: a string as itself, anything else as its JSON

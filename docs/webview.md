@@ -175,6 +175,21 @@ the view fills its space and scrolls itself, which is the honest fallback. The m
 for documents an app renders (a message body), not for arbitrary sites, whose `100vh`
 layouts and fixed elements assume a viewport the page cannot have here.
 
+### Processes (GTK)
+
+WebKitGTK 6 runs every `WebKitWebView` in its own `WebKitWebProcess` unless the view is
+created *related* to one that already has a process, so ten fit-content documents would
+have been ten processes. The GTK arm keeps one **anchor** view per process — created on the
+first web view, never shown, never freed, holding an empty document so its process is up —
+and creates every view with `WebView::builder().related_view(&anchor)`. Measured on the
+reference box (`ps`, debug build): one `WebKitWebProcess` at ~180 MB RSS and one
+`WebKitNetworkProcess` at ~48 MB for four views (the anchor and three documents), the
+same two processes for one view; without the anchor each view added a process. The shared
+process also stays warm between pages, which is where the ~110 ms first-height latency
+above comes from rather than a cold engine start. All views share the default
+`WebContext`/`NetworkSession`, which `related_view` requires. Sessions (`WebSession`) are
+unaffected: a retained view is still one live view, only its process is shared.
+
 ## Inline sites: `web_view_inline` (app-embedded content)
 
 A directory under `resource/assets/` can ship a whole site (pages, stylesheets, scripts,
