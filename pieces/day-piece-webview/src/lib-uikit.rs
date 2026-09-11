@@ -39,7 +39,7 @@ struct NavIvars {
     /// to whichever node is currently showing it.
     node: Cell<NodeId>,
     /// Inline mode (docs/webview.md): the `file://` URL prefix of the bundled site's root.
-    /// A main-frame navigation outside it is cancelled and reported (`LINK_REPORT`); `None`
+    /// A main-frame navigation outside it is cancelled and reported (`Report::Link`); `None`
     /// (remote mode) polices nothing.
     inline_base: RefCell<Option<String>>,
 }
@@ -63,7 +63,7 @@ define_class!(
         #[unsafe(method(webView:didFinishNavigation:))]
         fn did_finish(&self, web_view: &WKWebView, _navigation: *mut AnyObject) {
             if let Some(url) = current_url(web_view) {
-                day_uikit::emit(self.ivars().node.get(), Event::custom("webview:url", url));
+                day_uikit::emit(self.ivars().node.get(), Report::Url.event(url));
             }
         }
 
@@ -97,11 +97,7 @@ define_class!(
                     if sub_frame || inside {
                         POLICY_ALLOW
                     } else {
-                        day_uikit::emit(self.ivars().node.get(), Event::Custom {
-                            tag: "webview:link",
-                            num: super::LINK_REPORT,
-                            text: url,
-                        });
+                        day_uikit::emit(self.ivars().node.get(), Report::Link.event(url));
                         POLICY_CANCEL
                     }
                 }
@@ -258,14 +254,7 @@ fn eval(web: &WKWebView, node: NodeId, req: u64, script: &str) {
         } else {
             engine_error("WebKitError", "no result")
         };
-        day_uikit::emit(
-            node,
-            Event::Custom {
-                tag: "webview:eval",
-                num: req as f64,
-                text: payload,
-            },
-        );
+        day_uikit::emit(node, eval_reply(req, payload));
     });
     // SAFETY: main thread (a renderer duty); WebKit copies the block before returning.
     let _: () = unsafe { msg_send![web, evaluateJavaScript: &*js, completionHandler: &*handler] };

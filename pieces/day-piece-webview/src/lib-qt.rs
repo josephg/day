@@ -42,14 +42,7 @@ extern "C" fn on_eval(id: u64, req: u64, payload: *const c_char) {
             .to_string_lossy()
             .into_owned()
     };
-    day_qt::emit(
-        NodeId(id),
-        Event::Custom {
-            tag: "webview:eval",
-            num: req as f64,
-            text,
-        },
-    );
+    day_qt::emit(NodeId(id), eval_reply(req, text));
 }
 
 extern "C" fn on_url(id: u64, url: *const c_char) {
@@ -59,7 +52,7 @@ extern "C" fn on_url(id: u64, url: *const c_char) {
     let s = unsafe { CStr::from_ptr(url) }
         .to_string_lossy()
         .into_owned();
-    day_qt::emit(NodeId(id), Event::custom("webview:url", s));
+    day_qt::emit(NodeId(id), Report::Url.event(s));
 }
 
 /// An inline site's navigation left the site: the shim CANCELLED it (acceptNavigationRequest
@@ -71,14 +64,7 @@ extern "C" fn on_link(id: u64, url: *const c_char) {
     let s = unsafe { CStr::from_ptr(url) }
         .to_string_lossy()
         .into_owned();
-    day_qt::emit(
-        NodeId(id),
-        Event::Custom {
-            tag: "webview:link",
-            num: super::LINK_REPORT,
-            text: s,
-        },
-    );
+    day_qt::emit(NodeId(id), Report::Link.event(s));
 }
 
 fn cstr(s: &str) -> CString {

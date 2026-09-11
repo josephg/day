@@ -5,7 +5,7 @@
 // GTK: WebKitGTK 6.0 via the `webkit6` crate — a `WebView` widget (a `gtk4::Widget`). Written blind
 // (WebKitGTK isn't installed on the reference host); it builds+runs where `webkitgtk-6.0` is present
 // (the CI gtk jobs install it). The `uri` property notify reports navigation back via
-// `Event::custom("webview:url", …)`, matching the AppKit/Qt renderers. JavaScript evaluation
+// `Report::Url`, matching the AppKit/Qt renderers. JavaScript evaluation
 // rides `evaluate_javascript` and answers on the same channel keyed by request id
 // (docs/webview-eval.md).
 // ---------------------------------------------------------------------------
@@ -110,14 +110,7 @@ fn make(_backend: &mut Gtk, p: &WebProps, id: NodeId) -> gtk4::Widget {
     let ucm = webkit6::UserContentManager::new();
     ucm.register_script_message_handler(MESSAGE_HANDLER, None);
     ucm.connect_script_message_received(Some(MESSAGE_HANDLER), move |_ucm, value| {
-        day_gtk::emit(
-            id,
-            Event::Custom {
-                tag: "webview:message",
-                num: super::MESSAGE_REPORT,
-                text: message_text(value),
-            },
-        );
+        day_gtk::emit(id, Report::Message.event(message_text(value)));
     });
     // One web process for every view this piece creates (docs/webview.md § Processes):
     // WebKitGTK 6 gives each new WebView its own WebKitWebProcess unless it is created
@@ -157,7 +150,7 @@ fn make(_backend: &mut Gtk, p: &WebProps, id: NodeId) -> gtk4::Widget {
     // Report the current URL back on every navigation so a bound text field follows.
     wv.connect_uri_notify(move |wv| {
         if let Some(uri) = wv.uri() {
-            day_gtk::emit(id, Event::custom("webview:url", uri.to_string()));
+            day_gtk::emit(id, Report::Url.event(uri.to_string()));
         }
     });
     if !p.inline_root.is_empty() {
@@ -197,14 +190,7 @@ fn make(_backend: &mut Gtk, p: &WebProps, id: NodeId) -> gtk4::Widget {
                         return false; // let WebKit proceed
                     }
                     decision.ignore();
-                    day_gtk::emit(
-                        id,
-                        Event::Custom {
-                            tag: "webview:link",
-                            num: super::LINK_REPORT,
-                            text: uri,
-                        },
-                    );
+                    day_gtk::emit(id, Report::Link.event(uri));
                     true
                 });
                 wv.load_uri(&start);
@@ -248,14 +234,7 @@ fn make(_backend: &mut Gtk, p: &WebProps, id: NodeId) -> gtk4::Widget {
                 return false;
             }
             decision.ignore();
-            day_gtk::emit(
-                id,
-                Event::Custom {
-                    tag: "webview:link",
-                    num: super::LINK_REPORT,
-                    text: uri,
-                },
-            );
+            day_gtk::emit(id, Report::Link.event(uri));
             true
         });
         let base = p.base_url.clone();
@@ -330,14 +309,7 @@ fn install_fit(wv: &webkit6::WebView, ucm: &webkit6::UserContentManager, state: 
             );
         }
         st.fit.set(Some(h));
-        day_gtk::emit(
-            st.node,
-            Event::Custom {
-                tag: "webview:fit",
-                num: super::FIT_REPORT,
-                text: h.to_string(),
-            },
-        );
+        day_gtk::emit(st.node, Report::Fit.event(h.to_string()));
     });
     // Wheel and touchpad scrolling over the view: the page cannot scroll (its viewport is
     // its content), so forward the delta to the nearest GtkScrolledWindow above, the way
@@ -438,14 +410,7 @@ fn eval(wv: &webkit6::WebView, node: NodeId, req: u64, script: &str) {
                 Ok(_) => engine_error("WebKitError", "non-string reply"),
                 Err(e) => engine_error("WebKitError", &e.to_string()),
             };
-            day_gtk::emit(
-                node,
-                Event::Custom {
-                    tag: "webview:eval",
-                    num: req as f64,
-                    text: payload,
-                },
-            );
+            day_gtk::emit(node, eval_reply(req, payload));
         },
     );
 }

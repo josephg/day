@@ -7,7 +7,8 @@
 //! picker it's a reference for pieces that carry both a front-end AND their own native backend — here
 //! including an Android manifest permission contribution (INTERNET), see docs/extending.md.
 //!
-//! The view is a growing leaf that fills its space. Navigation is imperative and modeled with `Copy`
+//! The view is a growing leaf that fills its space — or, in [`WebView::fit_content`] mode, one as
+//! tall as its document. Navigation is imperative and modeled with `Copy`
 //! `Trigger`s — `.go()` loads the bound URL, `.back()`/`.forward()`/`.stop()`/`.reload()` drive
 //! history — each `watch`ed to a `WebPatch`. The bound URL is two-way: `.go()` loads it, and native
 //! navigation reports the current URL back so a bound text field follows along.
@@ -116,20 +117,66 @@ impl WebSession {
 // in-view and dispatched per [`LinkPolicy`] — the system browser by default.
 // ---------------------------------------------------------------------------
 
-/// The `num` the arms tag an external-link report with on the shared `Event::Custom` channel:
-/// navigation reports are `0`, eval replies are `≥ 1`, link reports are this, script
-/// messages are [`MESSAGE_REPORT`].
-const LINK_REPORT: f64 = -1.0;
+/// What an arm reports on the node's shared `Event::Custom` channel besides an eval reply.
+/// `num` is the discriminator (a cross-boundary Custom — JNI, C-ABI — carries only `num`/
+/// `text`, so it is what works everywhere); eval replies are `≥ 1` (the request id), and
+/// these are the reserved values below it. `tag` is the in-process spelling of the same
+/// thing, for logs and the mock.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Report {
+    /// A navigation landed: `text` is the current URL, so a bound text field follows along.
+    Url,
+    /// A navigation left an inline site (or, in document mode, the document): the arm
+    /// CANCELLED it, and the front-end runs the app's [`LinkPolicy`] on `text`.
+    Link,
+    /// The page posted a script message (docs/webview-eval.md § Script messages):
+    /// `window.webkit.messageHandlers.day.postMessage(value)` on the WebKit backends,
+    /// delivered to [`WebView::on_message`] with `text` = a string as itself, anything
+    /// else as its JSON.
+    Message,
+    /// A fit-content height report: the arm has stored the document's new height for its
+    /// `measure`, and the front-end marks the node for re-measure so layout picks it up.
+    Fit,
+}
 
-/// The `num` of a script message the page posted (docs/webview-eval.md § Script messages):
-/// `window.webkit.messageHandlers.day.postMessage(value)` on the WebKit backends, delivered
-/// to [`WebView::on_message`] with the value as text — a string as itself, anything else as
-/// its JSON.
-const MESSAGE_REPORT: f64 = -2.0;
+impl Report {
+    pub(crate) fn num(self) -> f64 {
+        match self {
+            Report::Url => 0.0,
+            Report::Link => -1.0,
+            Report::Message => -2.0,
+            Report::Fit => -3.0,
+        }
+    }
 
-/// The `num` of a fit-content height report: the arm has stored the document's new height
-/// for its `measure`, and the front-end marks the node for re-measure so layout picks it up.
-const FIT_REPORT: f64 = -3.0;
+    /// The report a `num` below 1 names, or `None` for a value no arm sends.
+    pub(crate) fn from_num(num: f64) -> Option<Report> {
+        [Report::Url, Report::Link, Report::Message, Report::Fit]
+            .into_iter()
+            .find(|r| r.num() == num)
+    }
+
+    pub(crate) fn tag(self) -> &'static str {
+        match self {
+            Report::Url => "webview:url",
+            Report::Link => "webview:link",
+            Report::Message => "webview:message",
+            Report::Fit => "webview:fit",
+        }
+    }
+
+    /// The event an arm emits for this report.
+    // Each arm is `#[cfg]`-gated to one toolkit, so on any single build most callers are
+    // compiled out (see `engine_error`).
+    #[allow(dead_code)]
+    pub(crate) fn event(self, text: impl Into<String>) -> Event {
+        Event::Custom {
+            tag: self.tag(),
+            num: self.num(),
+            text: text.into(),
+        }
+    }
+}
 
 /// What to do with a navigation that leaves an inline site — the answer an
 /// [`WebView::on_external_link`] handler returns. Without a handler, every external link is
@@ -425,6 +472,17 @@ pub(crate) fn engine_error(name: &str, message: &str) -> String {
     format!("0{SEP}{name}{SEP}{message}")
 }
 
+/// The event an arm answers an eval request with: `req` is the request id (`≥ 1`, above
+/// every [`Report`]), `payload` the wrapper's `1␟<json>` / `0␟<name>␟<message>` reply.
+#[allow(dead_code)] // gated per arm like `engine_error`
+pub(crate) fn eval_reply(req: u64, payload: impl Into<String>) -> Event {
+    Event::Custom {
+        tag: "webview:eval",
+        num: req as f64,
+        text: payload.into(),
+    }
+}
+
 /// Decode one reply produced by [`wrap_script`]. `undefined` and values `JSON.stringify` drops
 /// (a function, a symbol) both arrive as `null` — the wrapper normalizes them so the payload is
 /// always valid JSON.
@@ -622,6 +680,8 @@ pub fn eval_support() -> day_spec::Support {
 /// .stop()/.reload()`; fire them (`Trigger::notify`) from buttons.
 /// What `.on_link(…)` stores: decides what a navigation to a URL should do.
 type LinkDecider = Rc<dyn Fn(&str) -> LinkPolicy>;
+/// What `.on_message(…)` stores: receives a script message the page posted.
+type MessageListener = Rc<dyn Fn(&str)>;
 
 pub struct WebView {
     url: Signal<String>,
@@ -635,7 +695,7 @@ pub struct WebView {
     inline: Option<InlineSite>,
     inline_start: String,
     on_link: Option<LinkDecider>,
-    on_message: Option<Rc<dyn Fn(&str)>>,
+    on_message: Option<MessageListener>,
     html: Option<Signal<String>>,
     base_url: String,
     fit: bool,
@@ -919,42 +979,45 @@ impl Piece for WebView {
         }
 
         // Several kinds of report share this node's `Event::Custom` channel, told apart by
-        // `num`: 0 is navigation (the URL, so a bound text field follows along), ≥ 1 an
-        // evaluation reply keyed by its request id, and the negative reserved values below.
-        // In-process backends also tag them, but a cross-boundary Custom (JNI, C-ABI)
-        // carries only `num`/`text` — so `num` is the discriminator that works everywhere
-        // (§8.2's opened event channel).
+        // `num`: ≥ 1 is an evaluation reply keyed by its request id, and everything below is
+        // a [`Report`] (§8.2's opened event channel).
         cx.on(node, move |ev| {
             if let Event::Custom { num, text, .. } = ev {
                 if *num >= 1.0 {
                     resolve(*num as u64, text);
-                } else if *num == MESSAGE_REPORT {
-                    if let Some(f) = &on_message {
-                        f(text);
-                    }
-                } else if *num == FIT_REPORT {
-                    // The document's height changed: the arm holds the new value for its
-                    // `measure`; layout has to ask again (DESIGN.md §7.4).
-                    with_tree(|t| t.mark_needs_measure(node));
-                } else if *num == LINK_REPORT {
-                    // An inline site's navigation left the site: the arm already CANCELLED it
-                    // (§8.3 events are enqueue-only, so the native side can't ask), and the
-                    // policy runs here. `InView` re-issues the load as a command.
-                    let policy = on_link
-                        .as_ref()
-                        .map(|f| f(text))
-                        .unwrap_or(LinkPolicy::OpenSystem);
-                    match policy {
-                        LinkPolicy::OpenSystem => day_core::open_url(text),
-                        LinkPolicy::InView => {
-                            with_tree(|t| {
-                                t.patch(node, Box::new(WebPatch::Load(text.clone())), false)
-                            });
+                    return;
+                }
+                match Report::from_num(*num) {
+                    Some(Report::Url) => url.set(text.clone()),
+                    Some(Report::Message) => {
+                        if let Some(f) = &on_message {
+                            f(text);
                         }
-                        LinkPolicy::Ignore => {}
                     }
-                } else {
-                    url.set(text.clone());
+                    Some(Report::Fit) => {
+                        // The document's height changed: the arm holds the new value for its
+                        // `measure`; layout has to ask again (DESIGN.md §7.4).
+                        with_tree(|t| t.mark_needs_measure(node));
+                    }
+                    Some(Report::Link) => {
+                        // An inline site's navigation left the site: the arm already CANCELLED
+                        // it (§8.3 events are enqueue-only, so the native side can't ask), and
+                        // the policy runs here. `InView` re-issues the load as a command.
+                        let policy = on_link
+                            .as_ref()
+                            .map(|f| f(text))
+                            .unwrap_or(LinkPolicy::OpenSystem);
+                        match policy {
+                            LinkPolicy::OpenSystem => day_core::open_url(text),
+                            LinkPolicy::InView => {
+                                with_tree(|t| {
+                                    t.patch(node, Box::new(WebPatch::Load(text.clone())), false)
+                                });
+                            }
+                            LinkPolicy::Ignore => {}
+                        }
+                    }
+                    None => log::debug!("day-piece-webview: unknown report num {num}"),
                 }
             }
         });
@@ -1157,6 +1220,26 @@ mod tests {
                 "raw newline leaked for {hostile:?}: {js}"
             );
         }
+    }
+
+    /// The reserved `num`s round-trip through the enum and never collide with an eval reply
+    /// (`≥ 1`); an event built from a report carries both spellings.
+    #[test]
+    fn reports_round_trip() {
+        for r in [Report::Url, Report::Link, Report::Message, Report::Fit] {
+            assert!(r.num() < 1.0);
+            assert_eq!(Report::from_num(r.num()), Some(r));
+            assert_eq!(
+                r.event("x"),
+                Event::Custom {
+                    tag: r.tag(),
+                    num: r.num(),
+                    text: "x".into()
+                }
+            );
+        }
+        assert_eq!(Report::from_num(-4.0), None);
+        assert_eq!(Report::from_num(1.0), None);
     }
 
     #[test]

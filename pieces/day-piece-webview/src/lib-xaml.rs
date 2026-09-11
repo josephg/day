@@ -45,13 +45,9 @@ extern "C" fn on_eval(id: u64, req: u64, payload: *const c_char) {
     };
     day_xaml::emit(
         NodeId(id),
-        Event::Custom {
-            tag: "webview:eval",
-            // `num` is what tells an eval reply from the URL readback sharing this channel:
-            // URL reports keep 0, requests start at 1 (docs/webview-eval.md).
-            num: req as f64,
-            text,
-        },
+        // `num` is what tells an eval reply from the URL readback sharing this channel:
+        // URL reports keep 0, requests start at 1 (docs/webview-eval.md).
+        eval_reply(req, text),
     );
 }
 
@@ -62,7 +58,7 @@ extern "C" fn on_url(id: u64, url: *const c_char) {
     let s = unsafe { CStr::from_ptr(url) }
         .to_string_lossy()
         .into_owned();
-    day_xaml::emit(NodeId(id), Event::custom("webview:url", s));
+    day_xaml::emit(NodeId(id), Report::Url.event(s));
 }
 
 /// An inline site's navigation left the site: the shim CANCELLED it (NavigationStarting /
@@ -74,14 +70,7 @@ extern "C" fn on_link(id: u64, url: *const c_char) {
     let s = unsafe { CStr::from_ptr(url) }
         .to_string_lossy()
         .into_owned();
-    day_xaml::emit(
-        NodeId(id),
-        Event::Custom {
-            tag: "webview:link",
-            num: super::LINK_REPORT,
-            text: s,
-        },
-    );
+    day_xaml::emit(NodeId(id), Report::Link.event(s));
 }
 
 fn cstr(s: &str) -> CString {

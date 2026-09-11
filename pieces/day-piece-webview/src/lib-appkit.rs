@@ -28,7 +28,7 @@ struct NavIvars {
     /// to whichever node is currently showing it.
     node: Cell<NodeId>,
     /// Inline mode (docs/webview.md): the `file://` URL prefix of the bundled site's root.
-    /// A main-frame navigation outside it is cancelled and reported (`LINK_REPORT`); `None`
+    /// A main-frame navigation outside it is cancelled and reported (`Report::Link`); `None`
     /// (remote mode) polices nothing.
     inline_base: RefCell<Option<String>>,
 }
@@ -47,7 +47,7 @@ define_class!(
         #[unsafe(method(webView:didFinishNavigation:))]
         fn did_finish(&self, web_view: &WKWebView, _navigation: Option<&WKNavigation>) {
             if let Some(url) = current_url(web_view) {
-                day_appkit::emit(self.ivars().node.get(), Event::custom("webview:url", url));
+                day_appkit::emit(self.ivars().node.get(), Report::Url.event(url));
             }
         }
 
@@ -81,14 +81,7 @@ define_class!(
                     } else if inside {
                         WKNavigationActionPolicy::Allow
                     } else {
-                        day_appkit::emit(
-                            self.ivars().node.get(),
-                            Event::Custom {
-                                tag: "webview:link",
-                                num: super::LINK_REPORT,
-                                text: url,
-                            },
-                        );
+                        day_appkit::emit(self.ivars().node.get(), Report::Link.event(url));
                         WKNavigationActionPolicy::Cancel
                     }
                 }
@@ -251,14 +244,7 @@ fn eval(web: &WKWebView, node: NodeId, req: u64, script: &str) {
         } else {
             engine_error("WebKitError", "no result")
         };
-        day_appkit::emit(
-            node,
-            Event::Custom {
-                tag: "webview:eval",
-                num: req as f64,
-                text: payload,
-            },
-        );
+        day_appkit::emit(node, eval_reply(req, payload));
     });
     // SAFETY: main thread (a renderer duty), and WebKit copies the block before returning.
     unsafe { web.evaluateJavaScript_completionHandler(&js, Some(&handler)) };

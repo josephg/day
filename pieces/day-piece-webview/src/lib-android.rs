@@ -23,7 +23,7 @@ fn make(_backend: &mut Android, p: &WebProps, id: NodeId) -> AHandle {
     // Inline mode (docs/webview.md): the assets tree IS the APK `assets/` root, and WebView
     // browses it through `file:///android_asset/` (exempt from the API-30 file-access
     // default). The URL is composed here; the Java side polices navigations against the
-    // prefix and reports external ones back (LINK_REPORT).
+    // prefix and reports external ones back (`Report::Link`).
     let (url, prefix) = if p.inline_root.is_empty() {
         (p.url.clone(), String::new())
     } else {
