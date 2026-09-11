@@ -761,6 +761,7 @@ pub fn launch_with<P: Platform>(
             // of the pre-navigation state.
             day_reactive::on_main(move || {
                 if let Some(route) = nav::launch_deeplink()
+                    && !nav::intercept_route(&route)
                     && !nav::navigate(&route)
                 {
                     log::warn!("launch deep link {route:?} did not match a route");

@@ -305,9 +305,38 @@ pub(crate) fn take_requested_route() -> Option<String> {
 /// Apply a route the backend or a part asked for. Echoes of our own `set_route` match the current
 /// route and are dropped.
 pub(crate) fn apply_route_request(route: &str) {
+    if intercept_route(route) {
+        return;
+    }
     if current_route().as_deref() != Some(route) && !navigate(route) {
         log::warn!("requested route {route:?} did not match");
     }
+}
+
+thread_local! {
+    static ROUTE_INTERCEPTOR: RefCell<Option<Rc<dyn Fn(&str) -> bool>>> = const { RefCell::new(None) };
+}
+
+/// Claim routes that arrive from OUTSIDE the app — a deep link, cold or warm — before they
+/// are treated as navigation (docs/deep-links.md). The hook sees the route string
+/// (`route_of_url`'s answer: everything after the scheme) and returns `true` to consume it,
+/// in which case no surface is navigated. `false` hands the route on as usual.
+///
+/// This is the seam for a redirect that carries DATA rather than an address: an OAuth
+/// authorization's `login?code=…&state=…` lands here, and the app exchanges the code — an
+/// action, which a route into a nav surface could never perform (deep links only address
+/// surfaces), and one that must run whether or not the login page is the page on screen (a
+/// navigation to the page already showing is no change and rebuilds nothing, so its builder
+/// would never see the params). Routes the app itself calls `navigate` with are not
+/// intercepted. One hook per process; a later call replaces the earlier one. UI thread only.
+pub fn set_route_interceptor(f: impl Fn(&str) -> bool + 'static) {
+    ROUTE_INTERCEPTOR.with(|h| *h.borrow_mut() = Some(Rc::new(f)));
+}
+
+/// Offer an incoming route to the interceptor; `true` when it was consumed.
+pub(crate) fn intercept_route(route: &str) -> bool {
+    let hook = ROUTE_INTERCEPTOR.with(|h| h.borrow().clone());
+    hook.is_some_and(|f| f(route))
 }
 
 /// Whether a launch deep link is pending (`DAY_DEEPLINK` or a platform hint). A nav surface's
