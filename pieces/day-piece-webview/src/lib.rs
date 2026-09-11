@@ -56,6 +56,9 @@ pub struct WebProps {
     /// itself is installed on every view that can carry one; an arm that cannot logs once
     /// when a listener asked for it, instead of failing silently.
     pub messages: bool,
+    /// Fit-content mode ([`WebView::fit_content`]): the leaf's height is the document's
+    /// own, reported by an injected script, and the view never scrolls itself.
+    pub fit: bool,
 }
 
 /// A retained browsing session — the thing that outlives the view showing it.
@@ -123,6 +126,10 @@ const LINK_REPORT: f64 = -1.0;
 /// to [`WebView::on_message`] with the value as text — a string as itself, anything else as
 /// its JSON.
 const MESSAGE_REPORT: f64 = -2.0;
+
+/// The `num` of a fit-content height report: the arm has stored the document's new height
+/// for its `measure`, and the front-end marks the node for re-measure so layout picks it up.
+const FIT_REPORT: f64 = -3.0;
 
 /// What to do with a navigation that leaves an inline site — the answer an
 /// [`WebView::on_external_link`] handler returns. Without a handler, every external link is
@@ -631,6 +638,7 @@ pub struct WebView {
     on_message: Option<Rc<dyn Fn(&str)>>,
     html: Option<Signal<String>>,
     base_url: String,
+    fit: bool,
 }
 
 /// `web_view(url)` — a native web view showing `url`. The initial value loads on creation; call
@@ -658,6 +666,7 @@ pub fn web_view(url: Signal<String>) -> WebView {
         on_message: None,
         html: None,
         base_url: String::new(),
+        fit: false,
     }
 }
 
@@ -689,6 +698,17 @@ impl WebView {
     /// references (inline images an app wrote to disk) resolve.
     pub fn base_url(mut self, base: impl Into<String>) -> Self {
         self.base_url = base.into();
+        self
+    }
+
+    /// Size the view to its document instead of filling the space it is offered
+    /// (docs/webview.md § Fit-content documents): the leaf's intrinsic height is the
+    /// document's own, re-measured as the page reports changes (after each load, when
+    /// images land, when the width reflows it), and the view's own scrolling is off so an
+    /// enclosing `scroll(..)` owns the gesture. Made for a column of documents — a
+    /// conversation's messages, each in its own card. The width still fills.
+    pub fn fit_content(mut self) -> Self {
+        self.fit = true;
         self
     }
 }
@@ -772,6 +792,13 @@ pub fn message_support() -> day_spec::Support {
     }
 }
 
+/// Whether [`WebView::fit_content`] sizes the view to its document here. It rides the
+/// script-message channel, so the answer is [`message_support`]'s; elsewhere the view
+/// still fills its space (and scrolls itself), which is the honest fallback.
+pub fn fit_support() -> day_spec::Support {
+    message_support()
+}
+
 /// What this backend realizes. `Native` is a real embedded browser engine with the full command
 /// set; `Emulated` loads pages but cannot drive history or report navigation back (web-dom's
 /// `<iframe>`, see docs/webview.md); `Unsupported` renders day's placeholder leaf.
@@ -818,9 +845,11 @@ impl Piece for WebView {
             on_message,
             html,
             base_url,
+            fit,
         } = self;
         let initial = WebProps {
             messages: on_message.is_some(),
+            fit,
             url: url.get_untracked(),
             session: session.map(WebSession::id).unwrap_or(0),
             inline_root: inline.as_ref().map(|s| s.root.clone()).unwrap_or_default(),
@@ -834,12 +863,14 @@ impl Piece for WebView {
             base_url: base_url.clone(),
         };
         // A web view has no intrinsic size — it fills whatever space its container offers.
+        // In fit-content mode the height is the document's (the arm's `measure` answers
+        // with it), so the leaf is rigid vertically and grows only across.
         let node = cx.leaf(
             KIND,
             &initial,
             Flex {
                 grow_w: true,
-                grow_h: true,
+                grow_h: !fit,
                 ..Default::default()
             },
         );
@@ -901,6 +932,10 @@ impl Piece for WebView {
                     if let Some(f) = &on_message {
                         f(text);
                     }
+                } else if *num == FIT_REPORT {
+                    // The document's height changed: the arm holds the new value for its
+                    // `measure`; layout has to ask again (DESIGN.md §7.4).
+                    with_tree(|t| t.mark_needs_measure(node));
                 } else if *num == LINK_REPORT {
                     // An inline site's navigation left the site: the arm already CANCELLED it
                     // (§8.3 events are enqueue-only, so the native side can't ask), and the
@@ -957,6 +992,7 @@ pub trait WebViewBuilder: Sized {
     fn start_page(self, page: impl Into<String>) -> Self;
     fn on_external_link(self, f: impl Fn(&str) -> LinkPolicy + 'static) -> Self;
     fn on_message(self, f: impl Fn(&str) + 'static) -> Self;
+    fn fit_content(self) -> Self;
 }
 
 impl WebViewBuilder for WebView {
@@ -989,6 +1025,9 @@ impl WebViewBuilder for WebView {
     }
     fn on_message(self, f: impl Fn(&str) + 'static) -> Self {
         WebView::on_message(self, f)
+    }
+    fn fit_content(self) -> Self {
+        WebView::fit_content(self)
     }
 }
 
@@ -1024,6 +1063,9 @@ impl<Inner: WebViewBuilder + day_pieces::prelude::Piece> WebViewBuilder
     }
     fn on_message(self, f: impl Fn(&str) + 'static) -> Self {
         self.map_inner(|inner_piece| inner_piece.on_message(f))
+    }
+    fn fit_content(self) -> Self {
+        self.map_inner(|inner_piece| inner_piece.fit_content())
     }
 }
 

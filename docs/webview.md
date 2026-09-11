@@ -138,6 +138,43 @@ it re-issues the URL as a plain load.
 Native on GTK (verified), AppKit and UIKit (written, unverified); Qt, XAML, Android, ArkUI and
 web-dom log a warning and show nothing until they gain a `load_html` arm.
 
+### Fit-content documents
+
+```rust
+scroll(column((
+    message_header(a), web_view_html(body_a).fit_content(),
+    message_header(b), web_view_html(body_b).fit_content(),
+)))
+```
+
+A plain web view fills the space it is offered and scrolls its page inside. `.fit_content()`
+turns that around: the leaf's **height is the document's own** and the view never scrolls
+itself, so a column of documents — a conversation's messages, each under its native header —
+scrolls as one native `scroll(..)`. The width still fills (`Flex { grow_w: true, grow_h: false }`).
+
+How it works (GTK): the arm injects a user script at document end that watches the root
+element with a `ResizeObserver` and posts its border-box height on the piece's internal
+`dayFit` script-message handler whenever it changes — after the load, as images land, when
+a width change reflows the text; a user style sheet keeps the page from scrolling
+(`html { overflow: hidden; height: auto }`). The arm stores the height per view and answers
+`measure(proposal)` with `(proposal.width, height)`, and the front-end marks the node for
+re-measure on every report (`num = -3` on the shared `Custom` channel) so day's layout
+(DESIGN §7.4) picks the new size up at the turn boundary: the leaf grows, its column grows,
+the scroll's content size follows. The root box is measured rather than `scrollHeight`,
+which is clamped to the viewport and would never let a view shrink. Until the first report
+the view is 0 pt tall (the first height arrives ~110 ms after creation on the reference
+box). Wheel and touchpad scrolling over the view is captured by the piece and forwarded to
+the nearest `GtkScrolledWindow` above it (a wheel click moves `page_size^(2/3)`, GTK's own
+step), because WebKit would otherwise swallow the gesture over a page that has nothing to
+scroll; clicks, selection and keys stay the page's. Verified with a column of three
+documents of different lengths: heights follow content changes in both directions, a
+window resize reflows and re-measures them, and the wheel scrolls the column.
+
+Gate on `fit_support()`: it rides the script-message channel, so today it is GTK. Elsewhere
+the view fills its space and scrolls itself, which is the honest fallback. The mode is meant
+for documents an app renders (a message body), not for arbitrary sites, whose `100vh`
+layouts and fixed elements assume a viewport the page cannot have here.
+
 ## Inline sites: `web_view_inline` (app-embedded content)
 
 A directory under `resource/assets/` can ship a whole site (pages, stylesheets, scripts,

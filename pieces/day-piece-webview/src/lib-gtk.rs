@@ -14,7 +14,7 @@ use super::*;
 use day_gtk::Gtk;
 use day_spec::NodeId;
 use gtk4::prelude::*;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 use webkit6::prelude::*;
@@ -74,6 +74,34 @@ fn extract_tree(res_dir: &str, dest: &std::path::Path) -> Result<(), String> {
 /// The script-message handler name: `window.webkit.messageHandlers.day.postMessage(v)`.
 const MESSAGE_HANDLER: &str = "day";
 
+/// The fit-content height channel — a second handler so the piece's own traffic never
+/// reaches the app's `on_message`.
+const FIT_HANDLER: &str = "dayFit";
+
+/// Injected at document end into a fit-content view: reports the document's height (the
+/// root element's border box — NOT `scrollHeight`, which is clamped to the viewport and
+/// would never let the view shrink) whenever it changes: after the load, as images land,
+/// when a width change reflows the text. `ResizeObserver` covers all of them.
+const FIT_SCRIPT: &str = r#"(function(){
+if (window.__dayFit) return; window.__dayFit = true;
+var last = -1;
+function post() {
+  var d = document.documentElement, b = document.body;
+  var h = Math.ceil(d.getBoundingClientRect().height);
+  if (b) h = Math.max(h, Math.ceil(b.getBoundingClientRect().height + b.offsetTop));
+  if (h !== last) { last = h; window.webkit.messageHandlers.dayFit.postMessage(h); }
+}
+var ro = new ResizeObserver(post);
+ro.observe(document.documentElement);
+if (document.body) ro.observe(document.body);
+window.addEventListener('load', post);
+post();
+})();"#;
+
+/// The view never scrolls in fit-content mode: the outer native scroll owns the gesture,
+/// and the root box is what the script measures.
+const FIT_STYLE: &str = "html{overflow:hidden!important;height:auto!important}";
+
 fn make(_backend: &mut Gtk, p: &WebProps, id: NodeId) -> gtk4::Widget {
     // The page → Rust channel (docs/webview-eval.md § Script messages): one content manager
     // per view (it is a construct-only property), the `day` handler registered in the main
@@ -97,8 +125,13 @@ fn make(_backend: &mut Gtk, p: &WebProps, id: NodeId) -> gtk4::Widget {
     let state = Rc::new(ViewState {
         node: id,
         base: Rc::new(RefCell::new(p.base_url.clone())),
+        fit: Cell::new(if p.fit { Some(0.0) } else { None }),
+        born: std::time::Instant::now(),
     });
     VIEWS.with(|m| m.borrow_mut().insert(widget_key(&wv), state.clone()));
+    if p.fit {
+        install_fit(&wv, &ucm, &state);
+    }
     // `try_with`: at process exit the tree (and so this widget) is dropped by day-core's
     // thread-local destructor, which can run after VIEWS is already gone — `with` would
     // panic inside a non-unwinding GTK trampoline and abort the process.
@@ -234,6 +267,114 @@ struct ViewState {
     /// Document mode's live base URL, so a LoadHtml patch can move it and the policy
     /// closure sees the move.
     base: Rc<RefCell<String>>,
+    /// Fit-content mode: the document's last reported height in points (`None` = a
+    /// filling view). What `measure` answers with.
+    fit: Cell<Option<f64>>,
+    /// When the view was created, for the debug log's "first height after N ms".
+    born: std::time::Instant,
+}
+
+/// Fit-content mode (docs/webview.md): inject the height reporter and the no-scroll style,
+/// route the reports into `state.fit` + a re-measure, and hand wheel scrolling over the
+/// view to the enclosing native scroll (WebKit would otherwise swallow it, and a column
+/// of documents would be a column of scroll traps).
+fn install_fit(wv: &webkit6::WebView, ucm: &webkit6::UserContentManager, state: &Rc<ViewState>) {
+    use webkit6::{UserContentInjectedFrames, UserScriptInjectionTime, UserStyleLevel};
+    ucm.add_style_sheet(&webkit6::UserStyleSheet::new(
+        FIT_STYLE,
+        UserContentInjectedFrames::TopFrame,
+        UserStyleLevel::User,
+        &[],
+        &[],
+    ));
+    ucm.add_script(&webkit6::UserScript::new(
+        FIT_SCRIPT,
+        UserContentInjectedFrames::TopFrame,
+        UserScriptInjectionTime::End,
+        &[],
+        &[],
+    ));
+    ucm.register_script_message_handler(FIT_HANDLER, None);
+    let st = state.clone();
+    ucm.connect_script_message_received(Some(FIT_HANDLER), move |_ucm, value| {
+        let h = if value.is_number() {
+            value.to_double()
+        } else {
+            value.to_str().parse().unwrap_or(0.0)
+        };
+        let h = h.max(0.0);
+        if st.fit.get() == Some(h) {
+            return;
+        }
+        if st.fit.get() == Some(0.0) {
+            log::debug!(
+                "day-piece-webview: fit-content view {:?} first height {h} pt after {} ms",
+                st.node,
+                st.born.elapsed().as_millis()
+            );
+        }
+        st.fit.set(Some(h));
+        day_gtk::emit(
+            st.node,
+            Event::Custom {
+                tag: "webview:fit",
+                num: super::FIT_REPORT,
+                text: h.to_string(),
+            },
+        );
+    });
+    // Wheel and touchpad scrolling over the view: the page cannot scroll (its viewport is
+    // its content), so forward the delta to the nearest GtkScrolledWindow above, the way
+    // GTK itself would have if WebKit did not claim the event first. Captured before
+    // WebKit's own controller sees it; the page keeps clicks, selection and keys.
+    let scroll = gtk4::EventControllerScroll::new(
+        gtk4::EventControllerScrollFlags::VERTICAL | gtk4::EventControllerScrollFlags::KINETIC,
+    );
+    scroll.set_propagation_phase(gtk4::PropagationPhase::Capture);
+    let weak = wv.downgrade();
+    scroll.connect_scroll(move |ctl, _dx, dy| {
+        let Some(wv) = weak.upgrade() else {
+            return gtk4::glib::Propagation::Proceed;
+        };
+        let Some(sw) = enclosing_scrolled_window(wv.upcast_ref()) else {
+            return gtk4::glib::Propagation::Proceed;
+        };
+        let adj = sw.vadjustment();
+        // GtkScrolledWindow's own wheel step: a discrete click moves page_size^(2/3).
+        let step = if ctl.unit() == gtk4::gdk::ScrollUnit::Wheel {
+            adj.page_size().powf(2.0 / 3.0)
+        } else {
+            1.0
+        };
+        adj.set_value(adj.value() + dy * step);
+        gtk4::glib::Propagation::Stop
+    });
+    wv.add_controller(scroll);
+}
+
+/// The nearest `GtkScrolledWindow` above `w`, if any.
+fn enclosing_scrolled_window(w: &gtk4::Widget) -> Option<gtk4::ScrolledWindow> {
+    let mut cur = w.parent();
+    while let Some(p) = cur {
+        if let Ok(sw) = p.clone().downcast::<gtk4::ScrolledWindow>() {
+            return Some(sw);
+        }
+        cur = p.parent();
+    }
+    None
+}
+
+/// A fit-content view is as tall as its document and as wide as it is offered; any other
+/// view fills its space.
+fn measure(_backend: &mut Gtk, h: &gtk4::Widget, p: day_spec::Proposal) -> day_spec::Size {
+    let fit = h
+        .downcast_ref::<webkit6::WebView>()
+        .and_then(state_of)
+        .and_then(|s| s.fit.get());
+    match fit {
+        Some(height) => day_spec::Size::new(p.width.unwrap_or(0.0), height),
+        None => day_spec::Size::new(p.width.unwrap_or(0.0), p.height.unwrap_or(0.0)),
+    }
 }
 
 thread_local! {
@@ -337,4 +478,4 @@ fn update(_backend: &mut Gtk, h: &gtk4::Widget, patch: &WebPatch) {
 
 day_pieces::renderer!(day_gtk::RENDERERS, Gtk,
     kind: KIND, props: WebProps, patch: WebPatch,
-    make: make, update: update, measure: day_pieces::fill_measure);
+    make: make, update: update, measure: measure);
