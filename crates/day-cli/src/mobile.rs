@@ -1022,50 +1022,94 @@ pub(crate) fn installed_store_profile(app_id: &str) -> Option<InstalledStoreProf
     })
 }
 
-/// Every installed profile whose `application-identifier` names `app_id`, decoded.
+/// Every installed profile whose `application-identifier` covers `app_id`, decoded, the most
+/// specific first: the exact id, then wildcards from the longest prefix down to `TEAM.*` — the
+/// order Xcode resolves them in. Xcode 16 and later keep profiles under `Xcode/UserData`;
+/// `MobileDevice` is where older Xcodes (and a double-clicked profile) put them.
 fn decoded_profiles(app_id: &str) -> Vec<(PathBuf, String)> {
-    let mut found = Vec::new();
-    let Some(dir) = dirs_home().map(|h| h.join("Library/MobileDevice/Provisioning Profiles"))
-    else {
-        return found;
+    let mut found: Vec<(usize, PathBuf, String)> = Vec::new();
+    let Some(home) = dirs_home() else {
+        return Vec::new();
     };
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return found;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("mobileprovision") {
-            continue;
-        }
-        let Ok(out) = Command::new("security")
-            .args(["cms", "-D", "-i"])
-            .arg(&path)
-            .output()
-        else {
+    let mut seen = std::collections::HashSet::new();
+    for dir in [
+        "Library/Developer/Xcode/UserData/Provisioning Profiles",
+        "Library/MobileDevice/Provisioning Profiles",
+    ] {
+        let Ok(entries) = std::fs::read_dir(home.join(dir)) else {
             continue;
         };
-        if !out.status.success() {
-            continue;
-        }
-        let text = String::from_utf8_lossy(&out.stdout).into_owned();
-        // `<key>application-identifier</key><string>TEAMID.app.bundle.id</string>`
-        let Some(value) = text
-            .split("application-identifier")
-            .nth(1)
-            .and_then(|a| a.split("<string>").nth(1))
-            .and_then(|v| v.split("</string>").next())
-        else {
-            continue;
-        };
-        if value
-            .trim()
-            .split_once('.')
-            .is_some_and(|(_, id)| id == app_id)
-        {
-            found.push((path, text));
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("mobileprovision") {
+                continue;
+            }
+            // Profiles are named by UUID, so one reached through both directories (one a
+            // symlink to the other) counts once.
+            if !seen.insert(entry.file_name()) {
+                continue;
+            }
+            let Ok(out) = Command::new("security")
+                .args(["cms", "-D", "-i"])
+                .arg(&path)
+                .output()
+            else {
+                continue;
+            };
+            if !out.status.success() {
+                continue;
+            }
+            let text = String::from_utf8_lossy(&out.stdout).into_owned();
+            // `<key>application-identifier</key><string>TEAMID.app.bundle.id</string>`
+            let Some(value) = text
+                .split("application-identifier")
+                .nth(1)
+                .and_then(|a| a.split("<string>").nth(1))
+                .and_then(|v| v.split("</string>").next())
+            else {
+                continue;
+            };
+            if let Some(rank) = value
+                .trim()
+                .split_once('.')
+                .and_then(|(_, id)| profile_covers(id, app_id))
+            {
+                found.push((rank, path, text));
+            }
         }
     }
-    found
+    found.sort_by(|a, b| b.0.cmp(&a.0));
+    found.into_iter().map(|(_, path, text)| (path, text)).collect()
+}
+
+/// How specifically a profile's app id (`dev.example.app`, `dev.example.*`, `*`) covers
+/// `app_id`: `None` when it does not, otherwise a rank where higher is more specific and the
+/// exact id outranks every wildcard.
+fn profile_covers(pattern: &str, app_id: &str) -> Option<usize> {
+    if pattern == app_id {
+        return Some(usize::MAX);
+    }
+    let prefix = pattern.strip_suffix('*')?;
+    app_id.starts_with(prefix).then_some(prefix.len())
+}
+
+#[cfg(test)]
+mod profile_tests {
+    use super::profile_covers;
+
+    #[test]
+    fn exact_beats_longer_wildcard_beats_team_wildcard() {
+        let exact = profile_covers("dev.example.app", "dev.example.app").unwrap();
+        let prefix = profile_covers("dev.example.*", "dev.example.app").unwrap();
+        let any = profile_covers("*", "dev.example.app").unwrap();
+        assert!(exact > prefix && prefix > any);
+    }
+
+    #[test]
+    fn a_wildcard_for_another_prefix_does_not_cover() {
+        assert_eq!(profile_covers("com.other.*", "dev.example.app"), None);
+        assert_eq!(profile_covers("dev.example.other", "dev.example.app"), None);
+    }
 }
 
 /// An App Store profile provisions no devices and is not an enterprise (all-devices) profile.
@@ -1361,6 +1405,27 @@ fn sign_ios_bundle(project: &Project, app: &Path, prof: &InstalledProfile) -> Re
             .arg(&plist),
         "plutil -extract Entitlements",
     )?;
+    // A wildcard profile grants `TEAM.*`; the signature claims the concrete id, as Xcode's does.
+    let ident = Command::new("/usr/libexec/PlistBuddy")
+        .args(["-c", "Print :application-identifier"])
+        .arg(&ents)
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+    if let Some((team, id)) = ident.split_once('.') {
+        if id.ends_with('*') {
+            run_logged(
+                Command::new("/usr/libexec/PlistBuddy")
+                    .arg("-c")
+                    .arg(format!(
+                        "Set :application-identifier {team}.{}",
+                        project.manifest.app.id
+                    ))
+                    .arg(&ents),
+                "PlistBuddy application-identifier",
+            )?;
+        }
+    }
 
     // What the app declares and what the profile grants have to agree. Catching it here beats
     // shipping an app to the device that silently cannot register for push.
