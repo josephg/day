@@ -4131,6 +4131,17 @@ mod imp {
             fn preferred_edges(&self) -> UIRectEdge {
                 rect_edges()
             }
+
+            /// The system appearance changed under the running app (Settings, Control
+            /// Centre, the simulator's appearance switch): refresh day-core's reactive
+            /// dark-mode signal so palette closures recolor live, as the AppKit and GTK
+            /// arms do from their observers. `dark_mode()` reads the current trait
+            /// collection, which UIKit has already moved by the time this is called.
+            #[unsafe(method(traitCollectionDidChange:))]
+            fn trait_collection_did_change(&self, previous: *mut AnyObject) {
+                let _: () = unsafe { msg_send![super(self), traitCollectionDidChange: previous] };
+                day_spec::ffi_guard::contain((), day_core::note_appearance_changed);
+            }
         }
     );
 
