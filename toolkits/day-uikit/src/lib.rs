@@ -3303,9 +3303,12 @@ mod imp {
 
     /// Rebuild the split host for the destination in force (`SplitParts::list_shown`,
     /// docs/navigation.md): a fresh split of the other style with fresh column controllers,
-    /// the pages moved across, swapped into the same container. Expanded only — collapsed,
-    /// the columns are one stack and the list joins it through `NavPatch::ListInStack`. Every
-    /// UIKit call runs outside the state borrow: each re-enters the navigation delegate.
+    /// the pages moved across, swapped into the same container. Collapsed too: there the
+    /// pages sit on the merged primary stack, so they are gathered from it, and the fresh
+    /// host collapses again as it enters the window — its collapse delegate then tops the
+    /// stack with the content list, which a host built for a list-less destination (a
+    /// phone that launched on Settings) had no column for. Every UIKit call runs outside
+    /// the state borrow: each re-enters the navigation delegate.
     fn rehost_split(host: usize) {
         let Some(mtm) = MainThreadMarker::new() else {
             return;
@@ -3315,20 +3318,42 @@ mod imp {
             let state = m.get(&host)?;
             let parts = state.split.as_ref()?;
             let list_width = parts.list_width?;
-            if state.collapsed.get() || unsafe { parts.split_vc.isCollapsed() } {
-                return None;
-            }
             let triple = parts.list_shown.get();
             if triple == parts.supplementary_nav.is_some() {
                 return None;
+            }
+            let collapsed = state.collapsed.get() || unsafe { parts.split_vc.isCollapsed() };
+            let list_vc = parts.list_vc.borrow().clone();
+            // The pages, by the pane each was declared for (`pane_of`): while expanded the
+            // sidebar is the primary's root and the details are the secondary's; while
+            // collapsed everything sits on the merged primary, in an order iOS 26's nesting
+            // does not promise, and a destination the same selection change popped is still
+            // animating out of it — no longer a Day page, so `pane_of` answers `None`.
+            let merged = if collapsed {
+                day_pages(&parts.primary_nav, parts.secondary_placeholder.as_deref())
+            } else {
+                let mut all = day_pages(&parts.primary_nav, None);
+                all.extend(day_pages(&state.nav, parts.secondary_placeholder.as_deref()));
+                all
+            };
+            let mut sidebar = None;
+            let mut details = Vec::new();
+            for vc in merged {
+                match pane_of(&vc) {
+                    Some(Some(day_spec::props::Pane::Sidebar)) => sidebar = Some(vc),
+                    Some(Some(day_spec::props::Pane::List)) => {}
+                    Some(_) => details.push(vc),
+                    None => {}
+                }
             }
             Some((
                 parts.split_vc.clone(),
                 parts.primary_nav.clone(),
                 parts.supplementary_nav.clone(),
                 state.nav.clone(),
-                day_pages(&state.nav, parts.secondary_placeholder.as_deref()),
-                parts.list_vc.borrow().clone(),
+                details,
+                sidebar,
+                list_vc,
                 parts.container.clone(),
                 parts._split_delegate.clone(),
                 list_width,
@@ -3342,6 +3367,7 @@ mod imp {
             old_snav,
             old_secondary,
             vcs,
+            sidebar,
             list_vc,
             container,
             split_delegate,
@@ -3357,10 +3383,16 @@ mod imp {
         }
         note_ui_transition();
         let empty = objc2_foundation::NSArray::<UIViewController>::new();
-        let sidebar = unsafe { old_primary.viewControllers() }.firstObject();
         unsafe {
             // Pages out of the old columns — a page mounts in one stack at a time — then the
             // old host out of the window, then a fresh host with fresh column controllers.
+            // While collapsed the merged primary holds every page, and UIKit's nested
+            // controllers hold their own: empty each so no page is still parented.
+            for vc in old_primary.viewControllers().iter() {
+                if let Some(n) = vc.downcast_ref::<objc2_ui_kit::UINavigationController>() {
+                    n.setViewControllers(&empty);
+                }
+            }
             old_primary.setViewControllers(&empty);
             if let Some(snav) = &old_snav {
                 snav.setViewControllers(&empty);
@@ -8253,7 +8285,7 @@ mod imp {
                         // the delegate synchronously, which re-borrows NAV_STATE.
                         enum Act {
                             Title(Retained<UIViewController>, String),
-                            /// Show/hide the supplementary column (expanded triple only).
+                            /// Rebuild the host for the destination's column count.
                             Column,
                             /// Collapsed triple only: the content list joins or leaves the
                             /// merged stack through UIKit's own column APIs.
@@ -8269,7 +8301,8 @@ mod imp {
                             let Some(state) = m.get_mut(&ptr_of(h)) else {
                                 return Act::None;
                             };
-                            let collapsed_triple = state.collapsed.get()
+                            let collapsed_now = state.collapsed.get();
+                            let collapsed_triple = collapsed_now
                                 && state
                                     .split
                                     .as_ref()
@@ -8337,7 +8370,7 @@ mod imp {
                                     if let Some(p) = state.split.as_ref() {
                                         p.list_shown.set(*v);
                                     }
-                                    if !state.collapsed.get() {
+                                    if !collapsed_now {
                                         Act::Column
                                     } else if collapsed_triple {
                                         let parts = state.split.as_ref().expect("triple");
@@ -8347,7 +8380,10 @@ mod imp {
                                             show: *v,
                                         }
                                     } else {
-                                        Act::None
+                                        // A collapsed DOUBLE host asked for the list: rebuild
+                                        // as a triple (`rehost_split` gathers the merged
+                                        // pages), whose collapse then tops with the list.
+                                        Act::Column
                                     }
                                 }
                             }
