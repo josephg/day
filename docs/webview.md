@@ -65,9 +65,9 @@ below is that route, though web-dom has no `load_html` arm for it yet.
 
 Evaluating JavaScript and reading a value back is covered in [docs/webview-eval.md](webview-eval.md), which keeps the per-platform support list current:
 `JsHandle::eval(script).await` returns the value as JSON, or the error the script threw. Ask
-`eval_support()` before offering it: AppKit, UIKit, Qt, XAML, Android and ArkWeb have working
-arms; GTK has an engine but no arm yet, windows-qt ships no engine, and web-dom can never have
-one (`contentWindow.eval` throws across origins). See [webview-eval.md](./webview-eval.md) for
+`eval_support()` before offering it: AppKit, UIKit, GTK, Qt, XAML, Android and ArkWeb have
+working arms; windows-qt ships no engine (and macos-gtk/windows-gtk have no WebKitGTK), and
+web-dom can never have one (`contentWindow.eval` throws across origins). See [webview-eval.md](./webview-eval.md) for
 the per-platform research, the JavaScript envelope, and what each arm does.
 
 ### Sessions (surviving navigation)

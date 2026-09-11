@@ -5,7 +5,9 @@
 // GTK: WebKitGTK 6.0 via the `webkit6` crate — a `WebView` widget (a `gtk4::Widget`). Written blind
 // (WebKitGTK isn't installed on the reference host); it builds+runs where `webkitgtk-6.0` is present
 // (the CI gtk jobs install it). The `uri` property notify reports navigation back via
-// `Event::custom("webview:url", …)`, matching the AppKit/Qt renderers.
+// `Event::custom("webview:url", …)`, matching the AppKit/Qt renderers. JavaScript evaluation
+// rides `evaluate_javascript` and answers on the same channel keyed by request id
+// (docs/webview-eval.md).
 // ---------------------------------------------------------------------------
 
 use super::*;
@@ -71,6 +73,17 @@ fn extract_tree(res_dir: &str, dest: &std::path::Path) -> Result<(), String> {
 
 fn make(_backend: &mut Gtk, p: &WebProps, id: NodeId) -> gtk4::Widget {
     let wv = webkit6::WebView::new();
+    let state = Rc::new(ViewState {
+        node: id,
+        base: Rc::new(RefCell::new(p.base_url.clone())),
+    });
+    VIEWS.with(|m| m.borrow_mut().insert(widget_key(&wv), state.clone()));
+    // `try_with`: at process exit the tree (and so this widget) is dropped by day-core's
+    // thread-local destructor, which can run after VIEWS is already gone — `with` would
+    // panic inside a non-unwinding GTK trampoline and abort the process.
+    wv.connect_destroy(|w| {
+        let _ = VIEWS.try_with(|m| m.borrow_mut().remove(&widget_key(w)));
+    });
     // Report the current URL back on every navigation so a bound text field follows.
     wv.connect_uri_notify(move |wv| {
         if let Some(uri) = wv.uri() {
@@ -135,14 +148,7 @@ fn make(_backend: &mut Gtk, p: &WebProps, id: NodeId) -> gtk4::Widget {
         // the document's own load (the base itself, or about:blank without one) and
         // fragment jumps within it proceed. The base lives in a cell the LoadHtml patch
         // updates, keyed by the widget and dropped with it.
-        let base = Rc::new(RefCell::new(p.base_url.clone()));
-        DOC_BASES.with(|m| m.borrow_mut().insert(widget_key(&wv), base.clone()));
-        // `try_with`: at process exit the tree (and so this widget) is dropped by day-core's
-        // thread-local destructor, which can run after DOC_BASES is already gone — `with`
-        // would panic inside a non-unwinding GTK trampoline and abort the process.
-        wv.connect_destroy(|w| {
-            let _ = DOC_BASES.try_with(|m| m.borrow_mut().remove(&widget_key(w)));
-        });
+        let base = state.base.clone();
         wv.connect_decide_policy(move |_wv, decision, dtype| {
             use webkit6::PolicyDecisionType;
             let uri = match dtype {
@@ -199,10 +205,56 @@ fn make(_backend: &mut Gtk, p: &WebProps, id: NodeId) -> gtk4::Widget {
     wv.upcast()
 }
 
+/// What the arm keeps per live web view, keyed by widget address and dropped on `destroy`.
+struct ViewState {
+    /// The node this view reports to — `update` is handed only the widget, and an eval
+    /// reply has to name the node it answers on.
+    node: NodeId,
+    /// Document mode's live base URL, so a LoadHtml patch can move it and the policy
+    /// closure sees the move.
+    base: Rc<RefCell<String>>,
+}
+
 thread_local! {
-    /// Document mode's live base URL per web view, so a LoadHtml patch can move it and the
-    /// policy closure above sees the move.
-    static DOC_BASES: RefCell<HashMap<usize, Rc<RefCell<String>>>> = RefCell::new(HashMap::new());
+    static VIEWS: RefCell<HashMap<usize, Rc<ViewState>>> = RefCell::new(HashMap::new());
+}
+
+fn state_of(wv: &webkit6::WebView) -> Option<Rc<ViewState>> {
+    VIEWS.with(|m| m.borrow().get(&widget_key(wv)).cloned())
+}
+
+/// Run `script` (already wrapped by the front-end, so it evaluates to a JS string) and
+/// report `1␟<json>` / `0␟<name>␟<message>` back on `node`, keyed by `req`.
+///
+/// Errors here are WebKit's own: a thrown exception surfaces as `WebKitJavascriptError`
+/// (`SCRIPT_FAILED`, message pre-formatted with `source_uri:line:col`) only when the
+/// wrapper itself failed to run — a page whose CSP refuses `eval`, a dead web process. A
+/// non-string value cannot come from the wrapper, so it is reported as an engine error too.
+/// The callback always arrives (WebKit answers with `CANCELLED` if the view is destroyed
+/// first), so nothing is left pending. Everything runs in the page's main world: the
+/// wrapper uses `eval`, and an isolated world could not read page globals anyway.
+fn eval(wv: &webkit6::WebView, node: NodeId, req: u64, script: &str) {
+    wv.evaluate_javascript(
+        script,
+        None,
+        Some("day-eval"),
+        gtk4::gio::Cancellable::NONE,
+        move |result| {
+            let payload = match result {
+                Ok(v) if v.is_string() => v.to_str().to_string(),
+                Ok(_) => engine_error("WebKitError", "non-string reply"),
+                Err(e) => engine_error("WebKitError", &e.to_string()),
+            };
+            day_gtk::emit(
+                node,
+                Event::Custom {
+                    tag: "webview:eval",
+                    num: req as f64,
+                    text: payload,
+                },
+            );
+        },
+    );
 }
 
 fn widget_key(wv: &webkit6::WebView) -> usize {
@@ -215,12 +267,15 @@ fn update(_backend: &mut Gtk, h: &gtk4::Widget, patch: &WebPatch) {
         return;
     };
     match patch {
+        WebPatch::Eval { req, script } => {
+            if let Some(state) = state_of(wv) {
+                eval(wv, state.node, *req, script);
+            }
+        }
         WebPatch::LoadHtml { html, base } => {
-            DOC_BASES.with(|m| {
-                if let Some(cell) = m.borrow().get(&widget_key(wv)) {
-                    *cell.borrow_mut() = base.clone();
-                }
-            });
+            if let Some(state) = state_of(wv) {
+                *state.base.borrow_mut() = base.clone();
+            }
             wv.load_html(
                 html,
                 if base.is_empty() {
@@ -243,10 +298,6 @@ fn update(_backend: &mut Gtk, h: &gtk4::Widget, patch: &WebPatch) {
         }
         WebPatch::Stop => wv.stop_loading(),
         WebPatch::Reload => wv.reload(),
-        // Not implemented on this backend yet (docs/webview-eval.md). `eval_support()`
-        // reports Unsupported, so the front-end resolves the future without dispatching
-        // and this arm is unreachable — it exists to keep the match exhaustive.
-        WebPatch::Eval { .. } => {}
     }
 }
 

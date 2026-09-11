@@ -588,12 +588,14 @@ pub fn eval_support() -> day_spec::Support {
         all(feature = "mdc", target_os = "android"),
         // `runJavaScript` in the ArkTS component, replying on `pieceEvent`'s num slot.
         all(feature = "arkui", target_env = "ohos"),
+        // `evaluate_javascript` in lib-gtk.rs (Linux only: macos-gtk / windows-gtk have no
+        // WebKitGTK and realize the placeholder).
+        all(feature = "gtk", not(target_os = "macos"), not(windows)),
     )) {
         day_spec::Support::Native
     } else {
-        // GTK has an engine and an equivalent call; its arm is not written yet
-        // (docs/webview-eval.md). web-dom cannot ever do this for REMOTE pages —
-        // `contentWindow.eval` throws across origins.
+        // web-dom cannot ever do this for REMOTE pages — `contentWindow.eval` throws
+        // across origins.
         day_spec::Support::Unsupported
     }
 }

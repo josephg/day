@@ -11,17 +11,23 @@ SPDX-License-Identifier: CC-BY-SA-4.0
 # Web view JavaScript evaluation
 
 > [!IMPORTANT]
-> **Status: partly implemented.** The front-end ships: `JsHandle::eval` returning a future, the
-> JavaScript envelope, the request/reply codec, `eval_support()`, and the `num`-keyed split that
-> keeps evaluation replies from clobbering the URL readback. **AppKit, UIKit, Qt, XAML, Android
-> and ArkWeb** have working arms; `eval_support()` reports `Native` there. Android ships the
+> **Status: implemented on every backend with an engine.** The front-end ships: `JsHandle::eval`
+> returning a future, the JavaScript envelope, the request/reply codec, `eval_support()`, and the
+> `num`-keyed split that keeps evaluation replies from clobbering the URL readback. **AppKit,
+> UIKit, GTK, Qt, XAML, Android and ArkWeb** have working arms; `eval_support()` reports
+> `Native` there. Android ships the
 > outer-JSON unquote and the null/empty→engine-error mapping in `DayWebView.evalJs`; ArkWeb rides
 > `runJavaScript` with an always-reply guarantee (pre-attach throws and promise rejections both
 > answer as engine errors) and accepts either reply serialization, since the SDK left it
 > unverified below.
 >
-> **GTK** carries an inert `WebPatch::Eval` arm so its `match` stays exhaustive, and reports
-> `Unsupported`. The per-platform research below is what that arm needs.
+> **GTK** (linux-gtk, 2026-09) rides `WebViewExt::evaluate_javascript` in the page's main world
+> with `source_uri = "day-eval"`; a string result is the wrapper's reply as is, anything else
+> (a `GError` — CSP refusing `eval`, a dead web process, `CANCELLED` on teardown — or a
+> non-string value) is reported as a `WebKitError` engine error. Verified live in
+> fastmail-native's reader: values, objects, throws and `SyntaxError`s round-trip through
+> the dayscript `web_eval` step. macos-gtk and windows-gtk have no WebKitGTK and stay
+> `Unsupported`.
 > **web-dom can never do this for remote pages**, because `contentWindow.eval` throws across origins
 > (an inline site's same-origin frame is the noted future exception, [docs/webview.md](webview.md)).
 >
@@ -153,6 +159,12 @@ that poisons the next operation unless cleared with `context.clear_exception()`.
 Any non-`NULL` `world_name` creates a distinct isolated world. The binding asserts it is called on the
 thread owning the default `MainContext`, and the closure is thread-guarded, so dropping it on another
 thread aborts. Cancellation is result-side only.
+
+The shipped arm (`lib-gtk.rs` `eval`) sidesteps `to_json` entirely: the front-end's wrapper
+always evaluates to a JS **string**, so the arm checks `is_string()` and takes `to_str()`;
+the ambiguous `None`/latent-exception path above never arises. It passes a `NULL` world (the
+wrapper's `eval` needs the page's globals) and no cancellable; the callback is guaranteed
+(WebKit answers `CANCELLED` when the view is destroyed first), so nothing stays pending.
 
 ### Qt — QWebEngineView
 
@@ -342,8 +354,8 @@ arm loads pages but cannot evaluate at all.
 1. **Front-end** — `WebPatch::Eval { req, script }`, the envelope builder, the pending map, the future,
    `eval_support()`, and the `num`-based fix to the URL handler. Testable against day-mock with a
    programmatic responder, mirroring `present`'s dayscript escape hatch.
-2. **GTK** — cheapest real arm. No new dependencies; `webkit6` is already there and re-exports
-   `javascriptcore`. Handle `to_json` returning `None` by checking and clearing the context exception.
+2. **GTK** — **done** (2026-09). No new dependencies; `webkit6` is already there and re-exports
+   `javascriptcore`. The `to_json`/`None` question never came up: the wrapper's reply is a string.
 3. **Apple** — add `block2` to the `appkit` and `uikit` features, plus the explicit `objc2-web-kit`
    features (`WKContentWorld`, `WKError`, `block2`) and `objc2-foundation` features (`NSError`,
    `NSDictionary`, `NSValue`, `NSNull`) that the lists currently omit. Factor the result marshaling into
