@@ -836,23 +836,30 @@ pub fn emit(id: NodeId, ev: Event) {
 /// shows a different slice at the same offset, and one channel should carry every cause.
 /// Enqueue-only through `emit` (§8.3); day-core also reports programmatic scrolls itself, so
 /// a `scroll_to` yields two identical reports the listener de-duplicates.
+///
+/// The arm holds the window WEAKLY: the closures live on the window's own adjustments, so a
+/// strong reference would be a cycle that kept the window — and its whole subtree, a
+/// conversation's web views included — alive after day dropped it. GTK removes a widget's
+/// tick callbacks when it is disposed, and a callback that still runs on a window no longer
+/// in a hierarchy (unparented, on its way out) emits nothing.
 fn hook_scroll_reports(sw: &gtk4::ScrolledWindow, id: NodeId) {
     let pending = Rc::new(std::cell::Cell::new(false));
-    let sw2 = sw.clone();
+    let weak = sw.downgrade();
     let arm: Rc<dyn Fn()> = Rc::new(move || {
+        let Some(sw) = weak.upgrade() else {
+            return;
+        };
         if pending.replace(true) {
             return;
         }
         let pending = pending.clone();
-        sw2.add_tick_callback(move |sw, _clock| {
+        sw.add_tick_callback(move |sw, _clock| {
             pending.set(false);
-            emit(
-                id,
-                Event::ScrollChanged(Point::new(
-                    sw.hadjustment().value(),
-                    sw.vadjustment().value(),
-                )),
-            );
+            if sw.root().is_none() {
+                return gtk4::glib::ControlFlow::Break;
+            }
+            let offset = Point::new(sw.hadjustment().value(), sw.vadjustment().value());
+            ffi_guard::contain((), || emit(id, Event::ScrollChanged(offset)));
             gtk4::glib::ControlFlow::Break
         });
     });
