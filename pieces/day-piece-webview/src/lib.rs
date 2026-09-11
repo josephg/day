@@ -857,11 +857,15 @@ impl WebView {
 }
 
 /// Whether this backend delivers the page's script messages to [`WebView::on_message`].
-/// GTK (linux) has the `UserContentManager` channel; the other arms have their engine's
+/// GTK (linux) has the `UserContentManager` channel and UIKit (iOS) a `WKUserContentController`
+/// handler; the other arms have their engine's
 /// equivalent (`WKUserContentController`, `addJavascriptInterface`, `QWebChannel`,
 /// `WebMessage`, `javaScriptProxy`) but no arm yet, and report `Unsupported`.
 pub fn message_support() -> day_spec::Support {
-    if cfg!(all(feature = "gtk", not(target_os = "macos"), not(windows))) {
+    if cfg!(any(
+        all(feature = "gtk", not(target_os = "macos"), not(windows)),
+        all(feature = "uikit", target_os = "ios"),
+    )) {
         day_spec::Support::Native
     } else {
         day_spec::Support::Unsupported
