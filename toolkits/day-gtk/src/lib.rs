@@ -2955,6 +2955,9 @@ impl Toolkit for Gtk {
                     // subject truncates instead of widening (or wrapping) its row.
                     label.set_wrap(false);
                     label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+                    // One line tall whatever the text holds (a newline in a preview included),
+                    // so the widget and `measure`'s single-paragraph layout agree on height.
+                    label.set_single_line_mode(true);
                 }
                 update_text_attrs(&label, Some(p.font), Some(p.color));
                 // GTK ships the de-emphasized look as a style class, so the theme decides the
@@ -4369,7 +4372,17 @@ impl Toolkit for Gtk {
                         layout.set_attributes(label.attributes().as_ref());
                     }
                 }
-                layout.set_wrap(gtk4::pango::WrapMode::WordChar);
+                // Measure the way the label RENDERS: a wrapping label folds at the proposed
+                // width, a single-line one (`Label::single_line`, realized as ellipsize +
+                // single-line mode) stays one line tall however long its text is. Wrapping the
+                // layout for both reported a long subject as three lines and overflowed every
+                // fixed-height list row it sat in, while the widget drew one ellipsized line.
+                if label.wraps() {
+                    layout.set_wrap(gtk4::pango::WrapMode::WordChar);
+                } else {
+                    layout.set_single_paragraph_mode(true);
+                    layout.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+                }
                 let (nat_w, _) = layout.pixel_size();
                 let w = match p.width {
                     Some(pw) => (nat_w as f64).min(pw),
