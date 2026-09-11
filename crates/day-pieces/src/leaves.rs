@@ -204,6 +204,8 @@ pub struct Label {
     /// What a tapped link run does. `None` opens the target in the platform's default handler,
     /// which is what a link in a paragraph of text is normally expected to do.
     pub(crate) on_link: Option<LinkHandler>,
+    /// `false` = one line, ellipsized at the trailing edge (a list row's subject or preview).
+    pub(crate) wraps: bool,
 }
 
 /// An app's handler for a tapped link run, shared because `Label` is cloned into its build.
@@ -223,6 +225,7 @@ pub fn label<M>(text: impl IntoText<M>) -> Label {
         markdown: false,
         align: day_spec::props::TextAlign::Leading,
         on_link: None,
+        wraps: true,
     }
 }
 
@@ -251,6 +254,12 @@ impl Label {
     /// state's "nothing selected", a hint under a field, or a caption should wear.
     pub fn secondary(mut self) -> Self {
         self.role = day_spec::props::TextRole::Secondary;
+        self
+    }
+    /// One line, ellipsized at the trailing edge when the text is wider than the label — a
+    /// list row's subject or preview. The default wraps.
+    pub fn single_line(mut self) -> Self {
+        self.wraps = false;
         self
     }
     /// Render the text italic (slanted).
@@ -473,7 +482,7 @@ impl Piece for Label {
                 },
                 color: self.color.as_ref().map(|c| c.get_untracked()),
                 role: self.role,
-                wraps: true,
+                wraps: self.wraps,
                 runs,
             },
             Flex::default(),

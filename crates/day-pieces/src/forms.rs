@@ -133,6 +133,7 @@ impl<C: PieceSeq + 'static> Piece for FormSection<C> {
                     markdown: false,
                     align: day_spec::props::TextAlign::Leading,
                     on_link: None,
+                    wraps: true,
                     color: None,
                     role: Default::default(),
                 };
@@ -207,6 +208,7 @@ impl<P: Piece> Piece for Labeled<P> {
                 markdown: false,
                 align: day_spec::props::TextAlign::Leading,
                 on_link: None,
+                wraps: true,
                 color: None,
                 role: Default::default(),
             };

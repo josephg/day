@@ -2942,8 +2942,15 @@ impl Toolkit for Gtk {
                 label.set_xalign(xalign);
                 label.set_justify(justify);
                 label.set_yalign(0.0);
-                label.set_wrap(true);
-                label.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
+                if p.wraps {
+                    label.set_wrap(true);
+                    label.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
+                } else {
+                    // A single-line label reports a one-ellipsis minimum width, so a long
+                    // subject truncates instead of widening (or wrapping) its row.
+                    label.set_wrap(false);
+                    label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+                }
                 update_text_attrs(&label, Some(p.font), Some(p.color));
                 // GTK ships the de-emphasized look as a style class, so the theme decides the
                 // actual color and it follows light/dark the way the rest of the window does —
