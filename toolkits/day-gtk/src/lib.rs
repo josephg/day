@@ -4904,6 +4904,12 @@ impl Toolkit for Gtk {
         let popup_at = {
             let pop = popover.clone();
             move |x: f64, y: f64| {
+                // A late gesture on a row the list has since recycled or removed: without
+                // a toplevel there is no surface to parent the popup on, and GTK crashes
+                // realizing it (`gdk_surface_new_popup` on a dead parent).
+                if pop.parent().and_then(|p| p.root()).is_none() {
+                    return;
+                }
                 pop.set_pointing_to(Some(&gtk4::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
                 pop.popup();
             }
