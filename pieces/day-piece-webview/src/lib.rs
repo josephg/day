@@ -60,6 +60,9 @@ pub struct WebProps {
     /// Fit-content mode ([`WebView::fit_content`]): the leaf's height is the document's
     /// own, reported by an injected script, and the view never scrolls itself.
     pub fit: bool,
+    /// Fit-content mode: the height the leaf has until the document's first report
+    /// ([`WebView::estimated_height`]); `0` = the arm's floor (one line).
+    pub fit_estimate: f64,
 }
 
 /// A retained browsing session — the thing that outlives the view showing it.
@@ -699,6 +702,7 @@ pub struct WebView {
     html: Option<Signal<String>>,
     base_url: String,
     fit: bool,
+    fit_estimate: f64,
 }
 
 /// `web_view(url)` — a native web view showing `url`. The initial value loads on creation; call
@@ -727,6 +731,7 @@ pub fn web_view(url: Signal<String>) -> WebView {
         html: None,
         base_url: String::new(),
         fit: false,
+        fit_estimate: 0.0,
     }
 }
 
@@ -769,6 +774,17 @@ impl WebView {
     /// conversation's messages, each in its own card. The width still fills.
     pub fn fit_content(mut self) -> Self {
         self.fit = true;
+        self
+    }
+
+    /// Fit-content mode's opening height: what the leaf measures until the document's
+    /// first report lands (~110 ms after creation on the reference box), instead of the
+    /// arm's one-line floor. An app usually knows better — a message's plain text or
+    /// preview gives a line count, a card that was open before has its last height — and
+    /// a card that opens at roughly its final size does not grow a beat after it appears.
+    /// Clamped to the arm's range; ignored outside fit-content mode.
+    pub fn estimated_height(mut self, height: f64) -> Self {
+        self.fit_estimate = height.max(0.0);
         self
     }
 }
@@ -906,10 +922,12 @@ impl Piece for WebView {
             html,
             base_url,
             fit,
+            fit_estimate,
         } = self;
         let initial = WebProps {
             messages: on_message.is_some(),
             fit,
+            fit_estimate,
             url: url.get_untracked(),
             session: session.map(WebSession::id).unwrap_or(0),
             inline_root: inline.as_ref().map(|s| s.root.clone()).unwrap_or_default(),
@@ -1056,6 +1074,7 @@ pub trait WebViewBuilder: Sized {
     fn on_external_link(self, f: impl Fn(&str) -> LinkPolicy + 'static) -> Self;
     fn on_message(self, f: impl Fn(&str) + 'static) -> Self;
     fn fit_content(self) -> Self;
+    fn estimated_height(self, height: f64) -> Self;
 }
 
 impl WebViewBuilder for WebView {
@@ -1091,6 +1110,9 @@ impl WebViewBuilder for WebView {
     }
     fn fit_content(self) -> Self {
         WebView::fit_content(self)
+    }
+    fn estimated_height(self, height: f64) -> Self {
+        WebView::estimated_height(self, height)
     }
 }
 
@@ -1129,6 +1151,9 @@ impl<Inner: WebViewBuilder + day_pieces::prelude::Piece> WebViewBuilder
     }
     fn fit_content(self) -> Self {
         self.map_inner(|inner_piece| inner_piece.fit_content())
+    }
+    fn estimated_height(self, height: f64) -> Self {
+        self.map_inner(|inner_piece| inner_piece.estimated_height(height))
     }
 }
 

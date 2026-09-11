@@ -171,10 +171,15 @@ report (`Report::Fit`, `num = -3` on the shared `Custom` channel) so day's layou
 the scroll's content size follows. The root box is measured rather than `scrollHeight`,
 which is clamped to the viewport and would never let a view shrink; it also excludes what
 overflows it — absolutely-positioned or negative-margin content — which the
-`overflow: hidden` style clips, so what is measured is what shows. Before the first report,
-and again from the moment a `LoadHtml` replaces the document, the view is **one line tall
-(20 pt)** — a floor rather than the previous document's height or nothing (the first height
-arrives ~110 ms after creation on the reference box).
+`overflow: hidden` style clips, so what is measured is what shows. Before the first report
+the view is as tall as the app's **`.estimated_height(h)`** says, or **one line (20 pt)**
+without one — a floor rather than nothing (the first height arrives ~110 ms after creation
+on the reference box, so a card opened at the floor visibly grows a beat later; a message's
+plain text or preview gives a line count, and a card that was open before has its last
+measured height, either of which opens it at about its final size). A `LoadHtml` that
+replaces the document keeps the current height until the new document reports its own (a
+re-render of the same message — images allowed, a theme switch — lands at the same height
+or near it); only a terminated web process drops a view to the floor.
 
 Wheel and touchpad scrolling over the view: a **vertical** delta is captured by the piece and
 forwarded to the nearest *real* `GtkScrolledWindow` above it (a wheel click moves

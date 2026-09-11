@@ -161,7 +161,13 @@ fn make(_backend: &mut Gtk, p: &WebProps, id: NodeId) -> gtk4::Widget {
     let state = Rc::new(ViewState {
         node: id,
         base: RefCell::new(p.base_url.clone()),
-        fit: Cell::new(if p.fit { Some(FIT_MIN) } else { None }),
+        // The app's estimate (`estimated_height`) opens the view at about its final size;
+        // the floor when it gave none.
+        fit: Cell::new(if p.fit {
+            Some(p.fit_estimate.clamp(FIT_MIN, FIT_MAX))
+        } else {
+            None
+        }),
         fling: Cell::new(None),
     });
     VIEWS.with(|m| m.borrow_mut().insert(widget_key(&wv), state.clone()));
@@ -555,12 +561,12 @@ fn update(_backend: &mut Gtk, h: &gtk4::Widget, patch: &WebPatch) {
         WebPatch::LoadHtml { html, base } => {
             if let Some(state) = state_of(wv) {
                 *state.base.borrow_mut() = base.clone();
-                // A fit view drops to its floor for the new document rather than showing
-                // it at the old one's height until the first report lands.
-                if state.fit.get().is_some_and(|h| h != FIT_MIN) {
-                    state.fit.set(Some(FIT_MIN));
-                    day_gtk::emit(state.node, Report::Fit.event(FIT_MIN.to_string()));
-                }
+                // A fit view keeps its height across the reload: the new document reports
+                // its own as soon as it is laid out (the reporter observes the root on
+                // every load, ~110 ms), and until then the last measured height — the
+                // document was most likely re-rendered, not replaced — is the closest
+                // estimate there is. (It used to drop to the floor here, which made every
+                // re-render collapse the card to one line and grow it back.)
             }
             wv.load_html(
                 html,
