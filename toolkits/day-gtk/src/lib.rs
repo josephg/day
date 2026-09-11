@@ -1353,15 +1353,20 @@ fn fill_nav_menu(
             .get(i)
             .and_then(|o| o.as_deref())
             .and_then(|name| tinted_template_icon(name, tint));
-        let badge = badges.get(i).and_then(|o| o.as_deref()).map(|text| {
-            let b = gtk4::Label::new(Some(text));
-            // `dim-label` is the GNOME treatment for secondary text; numeric alignment keeps a
-            // column of counts from jittering as digits change.
-            b.add_css_class("dim-label");
-            b.add_css_class("numeric");
-            b.set_halign(gtk4::Align::End);
-            b
-        });
+        // An empty badge text is no badge: a reactive count of zero draws nothing.
+        let badge = badges
+            .get(i)
+            .and_then(|o| o.as_deref())
+            .filter(|t| !t.is_empty())
+            .map(|text| {
+                let b = gtk4::Label::new(Some(text));
+                // `dim-label` is the GNOME treatment for secondary text; numeric alignment keeps a
+                // column of counts from jittering as digits change.
+                b.add_css_class("dim-label");
+                b.add_css_class("numeric");
+                b.set_halign(gtk4::Align::End);
+                b
+            });
         // The trailing status glyph, tinted where the app gave it a meaning-bearing color —
         // the same `tinted_template_icon` path the leading icon takes, so a symbol resolves and
         // recolors identically at either end of the row.
