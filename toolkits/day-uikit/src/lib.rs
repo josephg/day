@@ -8296,9 +8296,33 @@ mod imp {
                                 // `Select` is a tabs host's; `ListInStack` is the model's own
                                 // bookkeeping of a merge UIKit performs by itself here
                                 // (docs/navigation.md).
-                                NavPatch::Presentation(_)
-                                | NavPatch::Select(_)
-                                | NavPatch::ListInStack(_) => Act::None,
+                                NavPatch::Presentation(_) | NavPatch::Select(_) => Act::None,
+                                // UIKit's collapse folds the list onto the merged stack by
+                                // itself, so the model's bookkeeping is mostly redundant here —
+                                // except after the USER popped the list (back to the sidebar
+                                // rows, the selection reset to the root): the next selection
+                                // re-interposes the list with this patch alone, the pane's
+                                // visibility never having changed, and nothing else would
+                                // show the column again. Leaving is UIKit's own pop.
+                                NavPatch::ListInStack(true) if collapsed_triple => {
+                                    let parts = state.split.as_ref().expect("triple");
+                                    let list_vc = parts.list_vc.borrow().clone();
+                                    let on_stack = list_vc.is_some_and(|lvc| {
+                                        day_pages(&parts.primary_nav, None)
+                                            .iter()
+                                            .any(|vc| std::ptr::eq(&**vc, &*lvc))
+                                    });
+                                    if on_stack {
+                                        Act::None
+                                    } else {
+                                        Act::TripleList {
+                                            svc: parts.split_vc.clone(),
+                                            primary: parts.primary_nav.clone(),
+                                            show: true,
+                                        }
+                                    }
+                                }
+                                NavPatch::ListInStack(_) => Act::None,
                                 // Retitle the content-list page's controller — its bar names
                                 // what the list is scoped to, live (`content_list_title`).
                                 NavPatch::ListTitle(t) => state
