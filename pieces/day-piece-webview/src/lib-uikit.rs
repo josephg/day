@@ -146,6 +146,12 @@ fn load_url(web: &WKWebView, url: &str) {
     let _: *mut AnyObject = unsafe { msg_send![web, loadRequest: &*req] };
 }
 
+fn load_html(web: &WKWebView, html: &str, base: &str) {
+    let ns = NSString::from_str(html);
+    let base_url = if base.is_empty() { None } else { NSURL::URLWithString(&NSString::from_str(base)) };
+    let _: *mut AnyObject = unsafe { msg_send![web, loadHTMLString: &*ns, baseURL: base_url.as_deref()] };
+}
+
 fn make(_backend: &mut Uikit, p: &WebProps, id: NodeId) -> Retained<UIView> {
     // A session already holding a view: re-attach it rather than build a new one. Only the node
     // changes — point the delegate at the node now showing it, and do NOT reload, since the whole
@@ -185,6 +191,19 @@ fn make(_backend: &mut Uikit, p: &WebProps, id: NodeId) -> Retained<UIView> {
                 "day-piece-webview: inline site {:?} not found in the staged assets",
                 p.inline_root
             );
+        }
+    } else if p.doc_mode {
+        // Document mode: the HTML is the page; links are policed against the base as an
+        // inline site's are (docs/webview.md). NOTE: the inline rule allows any URL under
+        // the base prefix, so a relative link to a sibling file would navigate this view;
+        // tighten to exact-base-or-fragment as the GTK arm does when this arm is verified.
+        // A `file://` base should go through `fileURLWithPath:` — `URLWithString:` returns
+        // nil for unencoded paths (spaces). Also to verify on a Mac.
+        if !p.base_url.is_empty() {
+            *nav.ivars().inline_base.borrow_mut() = Some(p.base_url.clone());
+        }
+        if !p.html.is_empty() {
+            load_html(&web, &p.html, &p.base_url);
         }
     } else if !p.url.is_empty() {
         load_url(&web, &p.url);
@@ -250,6 +269,17 @@ fn update(_backend: &mut Uikit, h: &Retained<UIView>, patch: &WebPatch) {
                 if let Some(node) = node_of(h) {
                     eval(web, node, *req, script);
                 }
+            }
+            WebPatch::LoadHtml { html, base } => {
+                let key = (h.as_ref() as *const UIView) as usize;
+                DELEGATES.with(|m| {
+                    if let Some(nav) = m.borrow().get(&key)
+                        && !base.is_empty()
+                    {
+                        *nav.ivars().inline_base.borrow_mut() = Some(base.clone());
+                    }
+                });
+                load_html(web, html, base)
             }
             WebPatch::Load(url) => load_url(web, url),
             WebPatch::Back => {

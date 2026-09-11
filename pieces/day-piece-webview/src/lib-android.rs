@@ -82,6 +82,10 @@ fn update(_backend: &mut Android, h: &AHandle, patch: &WebPatch) {
     }
     // Commands cross as (code, url): 0=load, 1=back, 2=forward, 3=stop, 4=reload.
     let (code, url) = match patch {
+        WebPatch::LoadHtml { .. } => {
+            log::warn!("day-piece-webview: document mode is not implemented on this backend yet");
+            return;
+        }
         WebPatch::Load(u) => (0, u.as_str()),
         WebPatch::Back => (1, ""),
         WebPatch::Forward => (2, ""),

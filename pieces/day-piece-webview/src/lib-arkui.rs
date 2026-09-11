@@ -42,6 +42,10 @@ fn update(_backend: &mut ArkUi, h: &AHandle, patch: &WebPatch) {
         return;
     }
     let (cmd, arg) = match patch {
+        WebPatch::LoadHtml { .. } => {
+            log::warn!("day-piece-webview: document mode is not implemented on this backend yet");
+            return;
+        }
         WebPatch::Load(u) => ("load", u.as_str()),
         WebPatch::Back => ("back", ""),
         WebPatch::Forward => ("forward", ""),

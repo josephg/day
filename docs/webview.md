@@ -60,8 +60,8 @@ lockdown. The switches that would let a file page read other files or reach othe
 (`setAllowFileAccessFromFileURLs`, `setAllowUniversalAccessFromFileURLs`) stay off, and web
 content can never navigate a WebView to `file://` itself; only the app's load can. web-dom is
 the exception with no filesystem at all: a `file://` URL renders nothing there, so a document an
-app wants shown on web too must arrive as content rather than as a file (an open gap; the piece has no
-direct-HTML API yet).
+app wants shown on web too must arrive as content rather than as a file — `web_view_html`
+below is that route, though web-dom has no `load_html` arm for it yet.
 
 Evaluating JavaScript and reading a value back is covered in [docs/webview-eval.md](webview-eval.md), which keeps the per-platform support list current:
 `JsHandle::eval(script).await` returns the value as JSON, or the error the script threw. Ask
@@ -110,6 +110,30 @@ backend that starts rebuilding instead of retaining fails CI rather than degradi
 GTK, Android, XAML, ArkUI and web-dom ignore `session` and rebuild as before. GTK's `release` also
 only detaches, so it is the next one that could carry this; the others would each need the same work
 Qt needed.
+
+## Documents: `web_view_html` (content the app holds)
+
+```rust
+let doc = Signal::new(String::new());
+Effect::new(move || doc.set(render_thread(scene, thread)));   // rebuilds the page as data changes
+web_view_html(doc)
+    .base_url(format!("file://{}/", images_dir.display()))      // where relative refs resolve
+    .on_external_link(|url| LinkPolicy::OpenSystem)
+```
+
+`web_view_html(html)` shows a DOCUMENT the app holds as a string — a rendered email, a report,
+a preview — and follows the signal: each write is a `WebPatch::LoadHtml` (the native
+`loadHTMLString:` / `load_html`). `.base_url(..)` is what the document's relative references
+resolve against, typically a `file:///dir/` the app wrote inline images into.
+
+Links are policed more strictly than an inline site's: **every** main-frame navigation the
+document starts is cancelled and reported to `on_external_link`, including one to a sibling
+file under the base. Only the document's own load and fragment jumps (`#id`) proceed, so the
+page can never navigate away from what the app rendered. `LinkPolicy::InView` still works —
+it re-issues the URL as a plain load.
+
+Native on GTK (verified), AppKit and UIKit (written, unverified); Qt, XAML, Android, ArkUI and
+web-dom log a warning and show nothing until they gain a `load_html` arm.
 
 ## Inline sites: `web_view_inline` (app-embedded content)
 

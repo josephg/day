@@ -12,6 +12,9 @@ use super::*;
 use day_gtk::Gtk;
 use day_spec::NodeId;
 use gtk4::prelude::*;
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::rc::Rc;
 use webkit6::prelude::*;
 
 /// Extract an inline site's tree from the GResource blob to the user cache dir, once per
@@ -125,10 +128,82 @@ fn make(_backend: &mut Gtk, p: &WebProps, id: NodeId) -> gtk4::Widget {
             }
             Err(e) => log::warn!("day-piece-webview: inline site {:?}: {e}", p.inline_root),
         }
+    } else if p.doc_mode {
+        // Document mode (docs/webview.md): the HTML is the page. Every main-frame navigation
+        // the document starts is cancelled and reported — so a rendered email can never
+        // navigate the reading pane away, not even to a sibling file under the base. Only
+        // the document's own load (the base itself, or about:blank without one) and
+        // fragment jumps within it proceed. The base lives in a cell the LoadHtml patch
+        // updates, keyed by the widget and dropped with it.
+        let base = Rc::new(RefCell::new(p.base_url.clone()));
+        DOC_BASES.with(|m| m.borrow_mut().insert(widget_key(&wv), base.clone()));
+        // `try_with`: at process exit the tree (and so this widget) is dropped by day-core's
+        // thread-local destructor, which can run after DOC_BASES is already gone — `with`
+        // would panic inside a non-unwinding GTK trampoline and abort the process.
+        wv.connect_destroy(|w| {
+            let _ = DOC_BASES.try_with(|m| m.borrow_mut().remove(&widget_key(w)));
+        });
+        wv.connect_decide_policy(move |_wv, decision, dtype| {
+            use webkit6::PolicyDecisionType;
+            let uri = match dtype {
+                PolicyDecisionType::NavigationAction | PolicyDecisionType::NewWindowAction => {
+                    decision
+                        .downcast_ref::<webkit6::NavigationPolicyDecision>()
+                        .and_then(|d| d.navigation_action())
+                        .and_then(|a| a.request())
+                        .and_then(|r| r.uri())
+                        .map(|u| u.to_string())
+                }
+                _ => None,
+            };
+            let Some(uri) = uri else { return false };
+            let b = base.borrow();
+            let inside = uri == "about:blank"
+                || (!b.is_empty()
+                    && (uri == *b
+                        || uri
+                            .strip_prefix(b.as_str())
+                            .is_some_and(|rest| rest.starts_with('#'))));
+            if inside && dtype == PolicyDecisionType::NavigationAction {
+                return false;
+            }
+            decision.ignore();
+            day_gtk::emit(
+                id,
+                Event::Custom {
+                    tag: "webview:link",
+                    num: super::LINK_REPORT,
+                    text: uri,
+                },
+            );
+            true
+        });
+        let base = p.base_url.clone();
+        if !p.html.is_empty() {
+            wv.load_html(
+                &p.html,
+                if base.is_empty() {
+                    None
+                } else {
+                    Some(base.as_str())
+                },
+            );
+        }
     } else if !p.url.is_empty() {
         wv.load_uri(&p.url);
     }
     wv.upcast()
+}
+
+thread_local! {
+    /// Document mode's live base URL per web view, so a LoadHtml patch can move it and the
+    /// policy closure above sees the move.
+    static DOC_BASES: RefCell<HashMap<usize, Rc<RefCell<String>>>> = RefCell::new(HashMap::new());
+}
+
+fn widget_key(wv: &webkit6::WebView) -> usize {
+    use gtk4::glib::prelude::ObjectType;
+    wv.as_ptr() as usize
 }
 
 fn update(_backend: &mut Gtk, h: &gtk4::Widget, patch: &WebPatch) {
@@ -136,6 +211,21 @@ fn update(_backend: &mut Gtk, h: &gtk4::Widget, patch: &WebPatch) {
         return;
     };
     match patch {
+        WebPatch::LoadHtml { html, base } => {
+            DOC_BASES.with(|m| {
+                if let Some(cell) = m.borrow().get(&widget_key(wv)) {
+                    *cell.borrow_mut() = base.clone();
+                }
+            });
+            wv.load_html(
+                html,
+                if base.is_empty() {
+                    None
+                } else {
+                    Some(base.as_str())
+                },
+            );
+        }
         WebPatch::Load(url) => wv.load_uri(url),
         WebPatch::Back => {
             if wv.can_go_back() {

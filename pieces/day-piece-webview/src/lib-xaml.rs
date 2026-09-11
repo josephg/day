@@ -112,6 +112,9 @@ fn make(_backend: &mut Xaml, p: &WebProps, id: NodeId) -> WinHandle {
 fn update(_backend: &mut Xaml, h: &WinHandle, patch: &WebPatch) {
     unsafe {
         match patch {
+            WebPatch::LoadHtml { .. } => {
+                log::warn!("day-piece-webview: document mode is not implemented on this backend yet");
+            }
             WebPatch::Load(url) => day_webview_xaml_load(h.0, cstr(url).as_ptr()),
             WebPatch::Back => day_webview_xaml_back(h.0),
             WebPatch::Forward => day_webview_xaml_forward(h.0),

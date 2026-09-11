@@ -75,6 +75,9 @@ fn make(backend: &mut Dom, p: &WebProps, _id: NodeId) -> DomHandle {
 
 fn update(backend: &mut Dom, h: &DomHandle, patch: &WebPatch) {
     match patch {
+        WebPatch::LoadHtml { .. } => {
+            log::warn!("day-piece-webview: document mode is not implemented on this backend yet");
+        }
         WebPatch::Load(url) => load(backend, h, url),
         WebPatch::Reload => {
             // Re-assign whatever we last set. Nothing to do before the first load.

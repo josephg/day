@@ -41,6 +41,17 @@ pub struct WebProps {
     /// The start page within `inline_root` (`"index.html"` unless overridden). Empty in
     /// remote mode.
     pub inline_start: String,
+    /// Document mode (docs/webview.md): the HTML to show, loaded as the page itself rather
+    /// than fetched. Empty in the other modes. Relative references resolve against
+    /// `base_url`, and every main-frame navigation the document starts (a link click) is
+    /// cancelled and reported for the app's `LinkPolicy`, as an inline site's are.
+    pub html: String,
+    /// Document mode's base URL (`file:///…/` for sibling files an app wrote); may be empty.
+    pub base_url: String,
+    /// Whether this view is in document mode at all — decided by the constructor, not by
+    /// whether the first document happens to be empty, so link policing is installed even
+    /// when the app's first render has not produced a page yet.
+    pub doc_mode: bool,
 }
 
 /// A retained browsing session — the thing that outlives the view showing it.
@@ -269,6 +280,11 @@ pub fn inline_support() -> day_spec::Support {
 /// Sparse imperative commands sent to the native view after creation.
 #[derive(Clone, Debug, PartialEq)]
 pub enum WebPatch {
+    /// Replace the document (document mode): new HTML, and the base URL it resolves against.
+    LoadHtml {
+        html: String,
+        base: String,
+    },
     /// Load a URL (from `.go()`).
     Load(String),
     /// History back / forward.
@@ -599,6 +615,8 @@ pub struct WebView {
     inline: Option<InlineSite>,
     inline_start: String,
     on_link: Option<LinkDecider>,
+    html: Option<Signal<String>>,
+    base_url: String,
 }
 
 /// `web_view(url)` — a native web view showing `url`. The initial value loads on creation; call
@@ -623,6 +641,8 @@ pub fn web_view(url: Signal<String>) -> WebView {
         inline: None,
         inline_start: String::new(),
         on_link: None,
+        html: None,
+        base_url: String::new(),
     }
 }
 
@@ -634,6 +654,30 @@ pub fn web_view(url: Signal<String>) -> WebView {
 /// Takes a prepared [`InlineSite`] (`res::assets::<dir>.prepare_site().await?`, the checked
 /// route) or the raw `res::assets::<dir>` constant (lazy — a missing page surfaces in the view).
 /// Gate on [`inline_support`].
+/// `web_view_html(html)` — a web view showing a DOCUMENT the app holds as a string, following
+/// the signal: a rendered email, a report, a preview (docs/webview.md). Relative references
+/// resolve against [`WebView::base_url`] (a `file:///dir/` an app wrote sibling files into),
+/// and every navigation the document starts — a link click — is cancelled and reported to
+/// [`WebView::on_external_link`], so the page never navigates away from the document. Fragment
+/// links (`#id`) stay in the page.
+///
+/// Native on the toolkits with a `loadHTMLString`/`load_html` (AppKit, UIKit, GTK); the other
+/// arms log and show nothing until they gain one.
+pub fn web_view_html(html: Signal<String>) -> WebView {
+    let mut v = web_view(Signal::new(String::new()));
+    v.html = Some(html);
+    v
+}
+
+impl WebView {
+    /// Document mode's base URL, e.g. `file:///…/bodies/` — where the document's relative
+    /// references (inline images an app wrote to disk) resolve.
+    pub fn base_url(mut self, base: impl Into<String>) -> Self {
+        self.base_url = base.into();
+        self
+    }
+}
+
 pub fn web_view_inline(site: impl IntoInlineSite) -> WebView {
     let mut v = web_view(Signal::new(String::new()));
     v.inline = Some(site.into_inline_site());
@@ -735,6 +779,8 @@ impl Piece for WebView {
             inline,
             inline_start,
             on_link,
+            html,
+            base_url,
         } = self;
         let initial = WebProps {
             url: url.get_untracked(),
@@ -745,6 +791,9 @@ impl Piece for WebView {
             } else {
                 String::new()
             },
+            doc_mode: html.is_some(),
+            html: html.map(|h| h.get_untracked()).unwrap_or_default(),
+            base_url: base_url.clone(),
         };
         // A web view has no intrinsic size — it fills whatever space its container offers.
         let node = cx.leaf(
@@ -780,6 +829,19 @@ impl Piece for WebView {
         }
         if let Some(reload) = reload {
             watch(move || reload.track(), move |_, _| send(WebPatch::Reload));
+        }
+        // Document mode: the page follows the HTML signal. The initial value loaded via props.
+        if let Some(html) = html {
+            let base = base_url.clone();
+            watch(
+                move || html.get(),
+                move |h, _| {
+                    send(WebPatch::LoadHtml {
+                        html: h.clone(),
+                        base: base.clone(),
+                    })
+                },
+            );
         }
 
         // Bind the eval handle to the realized node so `handle.eval(…)` knows where to send.
