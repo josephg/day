@@ -7855,7 +7855,14 @@ mod imp {
                     let label = unsafe { UILabel::new(mtm) };
                     unsafe {
                         label.setText(Some(&NSString::from_str(&p.text)));
-                        label.setNumberOfLines(0);
+                        // `Label::single_line()` (`wraps = false`): one line, ellipsized at
+                        // the trailing edge, the way a list row's subject wants it. A
+                        // wrapping label keeps UIKit's unlimited line count.
+                        label.setNumberOfLines(if p.wraps { 0 } else { 1 });
+                        if !p.wraps {
+                            // NSLineBreakByTruncatingTail; the NSText feature is not on.
+                            let _: () = msg_send![&*label, setLineBreakMode: 4isize];
+                        }
                     }
                     apply_font(&label, p.font);
                     // An explicit color wins; otherwise the ROLE chooses which adaptive system
@@ -9064,7 +9071,14 @@ mod imp {
                 }
                 kinds::LABEL => {
                     let w = p.width.unwrap_or(1.0e6);
-                    let s = fit(w, 1.0e6);
+                    // A single-line label measures ONE line: asked at the proposed width,
+                    // `sizeThatFits` reports the wrapped height even with `numberOfLines`
+                    // at 1, so it is measured unbounded and clamped to the proposal, the
+                    // same as the GTK arm's `set_single_line_mode` measure.
+                    let single = (**h)
+                        .downcast_ref::<UILabel>()
+                        .is_some_and(|l| unsafe { l.numberOfLines() } == 1);
+                    let s = if single { fit(1.0e6, 1.0e6) } else { fit(w, 1.0e6) };
                     Size::new(s.width.min(w), s.height)
                 }
                 kinds::BUTTON | kinds::TOGGLE => fit(1.0e6, 1.0e6),
