@@ -71,7 +71,9 @@ web-dom can never have one (`contentWindow.eval` throws across origins). See [we
 the per-platform research, the JavaScript envelope, and what each arm does. The reverse
 direction — the page posting to Rust with `window.webkit.messageHandlers.day.postMessage(v)`,
 received by `.on_message(|text| ..)` — is in the same document (§ Script messages); GTK has
-the arm, gate on `message_support()`.
+the arm, gate on `message_support()`. The handler exists only on a view whose app attached
+a listener, and what it delivers is whatever the page chose to post — for a
+`web_view_html` document that is untrusted content.
 
 ### Sessions (surviving navigation)
 
@@ -156,19 +158,39 @@ How it works (GTK): the arm injects a user script at document end that watches t
 element with a `ResizeObserver` and posts its border-box height on the piece's internal
 `dayFit` script-message handler whenever it changes — after the load, as images land, when
 a width change reflows the text; a user style sheet keeps the page from scrolling
-(`html { overflow: hidden; height: auto }`). The arm stores the height per view and answers
-`measure(proposal)` with `(proposal.width, height)`, and the front-end marks the node for
-re-measure on every report (`num = -3` on the shared `Custom` channel) so day's layout
+(`html { overflow: hidden; height: auto }`). The script and its handler live in an
+**isolated script world** (`day-fit`), not the page's: the document's own JavaScript
+cannot see `webkit.messageHandlers.dayFit`, monkey-patch the observer or post a height of
+its own (verified by evaluating `typeof webkit.messageHandlers.dayFit` in the page's main
+world: `"undefined"`, while the height still arrives). What does arrive is still a measure
+of untrusted content, so a non-finite value is dropped and the rest clamped to
+20 pt … 100 000 pt. The arm stores the height per view and answers `measure(proposal)`
+with `(proposal.width, height)`, and the front-end marks the node for re-measure on every
+report (`Report::Fit`, `num = -3` on the shared `Custom` channel) so day's layout
 (DESIGN §7.4) picks the new size up at the turn boundary: the leaf grows, its column grows,
 the scroll's content size follows. The root box is measured rather than `scrollHeight`,
-which is clamped to the viewport and would never let a view shrink. Until the first report
-the view is 0 pt tall (the first height arrives ~110 ms after creation on the reference
-box). Wheel and touchpad scrolling over the view is captured by the piece and forwarded to
-the nearest `GtkScrolledWindow` above it (a wheel click moves `page_size^(2/3)`, GTK's own
-step), because WebKit would otherwise swallow the gesture over a page that has nothing to
-scroll; clicks, selection and keys stay the page's. Verified with a column of three
-documents of different lengths: heights follow content changes in both directions, a
-window resize reflows and re-measures them, and the wheel scrolls the column.
+which is clamped to the viewport and would never let a view shrink; it also excludes what
+overflows it — absolutely-positioned or negative-margin content — which the
+`overflow: hidden` style clips, so what is measured is what shows. Before the first report,
+and again from the moment a `LoadHtml` replaces the document, the view is **one line tall
+(20 pt)** — a floor rather than the previous document's height or nothing (the first height
+arrives ~110 ms after creation on the reference box).
+
+Wheel and touchpad scrolling over the view: a **vertical** delta is captured by the piece and
+forwarded to the nearest *real* `GtkScrolledWindow` above it (a wheel click moves
+`page_size^(2/3)`, GTK's own step), because WebKit would otherwise swallow the gesture over
+a page that has nothing to scroll; day-gtk's min-size-breaker scrolled windows (both
+policies `External`) are skipped, and a fit view under no real scroll lets the event
+proceed. A **horizontal** delta (`|dx| > |dy|`) is left to the page, so a wide table in an
+`overflow-x: auto` box still pans. A touchpad flick continues as a fling on the outer
+adjustment: the controller's `decelerate` velocity is run down at GTK's own friction
+(`4/s`, gtkscrolledwindow.c) in 16 ms frames until it is spent or the scroll hits an end,
+and the next touch stops it — the scrolled window never sees the gesture itself, so it
+could not do this on its own. Clicks, selection and keys stay the page's. Verified with a
+column of three documents of different lengths: heights follow content changes in both
+directions, a window resize reflows and re-measures them, and the wheel scrolls the column
+(the fling is written to GTK's documented velocity units — pixels per ms — and not yet
+exercised on a touchpad; the reference box has none).
 
 Gate on `fit_support()`: it rides the script-message channel, so today it is GTK. Elsewhere
 the view fills its space and scrolls itself, which is the honest fallback. The mode is meant
@@ -180,15 +202,28 @@ layouts and fixed elements assume a viewport the page cannot have here.
 WebKitGTK 6 runs every `WebKitWebView` in its own `WebKitWebProcess` unless the view is
 created *related* to one that already has a process, so ten fit-content documents would
 have been ten processes. The GTK arm keeps one **anchor** view per process — created on the
-first web view, never shown, never freed, holding an empty document so its process is up —
-and creates every view with `WebView::builder().related_view(&anchor)`. Measured on the
-reference box (`ps`, debug build): one `WebKitWebProcess` at ~180 MB RSS and one
-`WebKitNetworkProcess` at ~48 MB for four views (the anchor and three documents), the
-same two processes for one view; without the anchor each view added a process. The shared
-process also stays warm between pages, which is where the ~110 ms first-height latency
-above comes from rather than a cold engine start. All views share the default
-`WebContext`/`NetworkSession`, which `related_view` requires. Sessions (`WebSession`) are
-unaffected: a retained view is still one live view, only its process is shared.
+first web view, never shown, and leaked on purpose (a `ManuallyDrop` in a thread-local, so
+no destructor touches WebKit at thread exit, when GTK may already be down), holding an
+empty document so its process is up — and creates every view with
+`WebView::builder().related_view(&anchor)`. Measured on the reference box (`ps`, debug
+build): one `WebKitWebProcess` at ~180 MB RSS and one `WebKitNetworkProcess` at ~48 MB for
+four views (the anchor and three documents), the same two processes for one view; without
+the anchor each view added a process. The shared process also stays warm between pages,
+which is where the ~110 ms first-height latency above comes from rather than a cold engine
+start.
+
+Two consequences. **A related view inherits the anchor's `WebContext` and
+`NetworkSession`** — libwebkitgtk ignores a network session set alongside `related-view` —
+so every view this arm creates shares the default context and session; if the piece ever
+sets either (a per-session cookie jar, an ephemeral context), the anchor has to be keyed per
+(context, session) rather than per process, since views in different sessions cannot share a
+process. (GTK has no `WebSession` arm today — `.session(..)` is ignored there, see
+§ Sessions — so nothing observes this yet.) And **one process is one fate**: a runaway
+script or a crash in any document takes every view's page down with it (WebKit shows them
+blank). The GTK arm handles `web-process-terminated` by logging the reason and, for a
+fit-content view, dropping its height back to the floor so a column does not keep a dead
+document's space; the app's next `LoadHtml` (a re-render, a reopened message) starts a
+fresh process. The other arms leave the signal unhandled.
 
 ## Inline sites: `web_view_inline` (app-embedded content)
 

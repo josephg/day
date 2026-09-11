@@ -5,9 +5,11 @@
 // GTK: WebKitGTK 6.0 via the `webkit6` crate — a `WebView` widget (a `gtk4::Widget`). Written blind
 // (WebKitGTK isn't installed on the reference host); it builds+runs where `webkitgtk-6.0` is present
 // (the CI gtk jobs install it). The `uri` property notify reports navigation back via
-// `Report::Url`, matching the AppKit/Qt renderers. JavaScript evaluation
-// rides `evaluate_javascript` and answers on the same channel keyed by request id
-// (docs/webview-eval.md).
+// `Report::Url`, matching the AppKit/Qt renderers. JavaScript evaluation rides
+// `evaluate_javascript` and answers on the same channel keyed by request id
+// (docs/webview-eval.md); script messages and fit-content heights come back through a
+// `UserContentManager` (docs/webview.md § Fit-content documents), and every view shares
+// one web process through a related anchor view (§ Processes).
 // ---------------------------------------------------------------------------
 
 use super::*;
@@ -16,6 +18,7 @@ use day_spec::NodeId;
 use gtk4::prelude::*;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::mem::ManuallyDrop;
 use std::rc::Rc;
 use webkit6::prelude::*;
 
@@ -27,7 +30,6 @@ use webkit6::prelude::*;
 /// direct route). Synchronous — it runs inside a day task poll or at realize, not on a render
 /// path; moving large-site extraction to a thread is the noted upgrade.
 pub(crate) fn extract_site(root: &str) -> Result<std::path::PathBuf, String> {
-    use std::cell::RefCell;
     day_core::tls_group! {
     static DONE: RefCell<std::collections::HashMap<String, std::path::PathBuf>> =
         RefCell::new(std::collections::HashMap::new());
@@ -75,13 +77,24 @@ fn extract_tree(res_dir: &str, dest: &std::path::Path) -> Result<(), String> {
 const MESSAGE_HANDLER: &str = "day";
 
 /// The fit-content height channel — a second handler so the piece's own traffic never
-/// reaches the app's `on_message`.
+/// reaches the app's `on_message`. Registered in [`FIT_WORLD`], not the page's main world:
+/// the page can neither see `webkit.messageHandlers.dayFit` nor the reporter's globals.
 const FIT_HANDLER: &str = "dayFit";
+
+/// The isolated script world the fit-content reporter runs in. An isolated world shares
+/// the document (the DOM the reporter measures) but has its own JavaScript globals — its
+/// own `window`, `ResizeObserver` and `webkit.messageHandlers` — so a document's script
+/// cannot monkey-patch the observer, pre-set the run-once guard, or post a fake height
+/// (verified: `typeof webkit.messageHandlers.dayFit` evaluated in the page's main world is
+/// `"undefined"`, and `window.__dayFit` is too, while the height still arrives).
+const FIT_WORLD: &str = "day-fit";
 
 /// Injected at document end into a fit-content view: reports the document's height (the
 /// root element's border box — NOT `scrollHeight`, which is clamped to the viewport and
 /// would never let the view shrink) whenever it changes: after the load, as images land,
-/// when a width change reflows the text. `ResizeObserver` covers all of them.
+/// when a width change reflows the text. `ResizeObserver` covers all of them. The border
+/// box excludes what overflows it (absolutely-positioned or negative-margin content), and
+/// the `overflow: hidden` style below clips exactly that, so what is measured is what shows.
 const FIT_SCRIPT: &str = r#"(function(){
 if (window.__dayFit) return; window.__dayFit = true;
 var last = -1;
@@ -102,40 +115,54 @@ post();
 /// and the root box is what the script measures.
 const FIT_STYLE: &str = "html{overflow:hidden!important;height:auto!important}";
 
+/// The height a fit-content view has before its document has reported one, and the least
+/// it can report: one line, so a column of cards does not collapse to nothing while the
+/// first heights are in flight (~110 ms after creation on the reference box) and an empty
+/// document still holds a row.
+const FIT_MIN: f64 = 20.0;
+
+/// The most a document can make its view: a page that reports more (or a broken measure)
+/// is capped rather than allowed to give layout a mile-high leaf.
+const FIT_MAX: f64 = 100_000.0;
+
+/// Kinetic scrolling's friction, per second — GTK's own `DECELERATION_FRICTION` from
+/// gtkscrolledwindow.c, so a flick over a document decelerates like one beside it.
+const FLING_FRICTION: f64 = 4.0;
+
+/// One frame of the fling ramp.
+const FLING_FRAME: std::time::Duration = std::time::Duration::from_millis(16);
+
 fn make(_backend: &mut Gtk, p: &WebProps, id: NodeId) -> gtk4::Widget {
     // The page → Rust channel (docs/webview-eval.md § Script messages): one content manager
     // per view (it is a construct-only property), the `day` handler registered in the main
-    // world. The value crosses as a JSCValue; a string is delivered as itself, anything
-    // else as its JSON, so the app sees one shape whatever the page posted.
+    // world — only when the app listens, so a view without an `on_message` exposes no
+    // `webkit.messageHandlers.day` to its page at all. The value crosses as a JSCValue; a
+    // string is delivered as itself, anything else as its JSON, so the app sees one shape
+    // whatever the page posted. The signal is connected BEFORE the handler is registered,
+    // so no message can arrive at an unconnected handler.
     let ucm = webkit6::UserContentManager::new();
-    ucm.register_script_message_handler(MESSAGE_HANDLER, None);
-    ucm.connect_script_message_received(Some(MESSAGE_HANDLER), move |_ucm, value| {
-        day_gtk::emit(id, Report::Message.event(message_text(value)));
-    });
+    if p.messages {
+        ucm.connect_script_message_received(Some(MESSAGE_HANDLER), move |_ucm, value| {
+            day_gtk::emit(id, Report::Message.event(message_text(value)));
+        });
+        ucm.register_script_message_handler(MESSAGE_HANDLER, None);
+    }
     // One web process for every view this piece creates (docs/webview.md § Processes):
     // WebKitGTK 6 gives each new WebView its own WebKitWebProcess unless it is created
     // `related` to one that already has a process, so a conversation of ten documents
-    // would be ten processes. The anchor is a view that is never shown and never freed;
-    // relating every view to it puts them all in the anchor's process, which also stays
-    // warm between conversations (the first page of a fresh process is the slow one).
-    let anchor = ANCHOR.with(|a| {
-        a.borrow_mut()
-            .get_or_insert_with(|| {
-                let a = webkit6::WebView::new();
-                a.load_html("<!doctype html><title>day</title>", None);
-                a
-            })
-            .clone()
-    });
+    // would be ten processes. Relating every view to the anchor puts them all in the
+    // anchor's process, which also stays warm between conversations (the first page of a
+    // fresh process is the slow one).
+    let anchor = anchor();
     let wv = webkit6::WebView::builder()
         .user_content_manager(&ucm)
         .related_view(&anchor)
         .build();
     let state = Rc::new(ViewState {
         node: id,
-        base: Rc::new(RefCell::new(p.base_url.clone())),
-        fit: Cell::new(if p.fit { Some(0.0) } else { None }),
-        born: std::time::Instant::now(),
+        base: RefCell::new(p.base_url.clone()),
+        fit: Cell::new(if p.fit { Some(FIT_MIN) } else { None }),
+        fling: Cell::new(None),
     });
     VIEWS.with(|m| m.borrow_mut().insert(widget_key(&wv), state.clone()));
     if p.fit {
@@ -146,6 +173,22 @@ fn make(_backend: &mut Gtk, p: &WebProps, id: NodeId) -> gtk4::Widget {
     // panic inside a non-unwinding GTK trampoline and abort the process.
     wv.connect_destroy(|w| {
         let _ = VIEWS.try_with(|m| m.borrow_mut().remove(&widget_key(w)));
+    });
+    // The shared process is also a shared fate: one document's runaway script or crash
+    // takes every view's page with it (WebKit shows them blank). Say so, and let a fit view
+    // give its height back rather than hold a dead document's — the app's next LoadHtml
+    // (a re-render, a reopened message) starts a fresh process.
+    let st = state.clone();
+    wv.connect_web_process_terminated(move |_wv, reason| {
+        log::warn!(
+            "day-piece-webview: the web process of view {:?} terminated ({reason:?}); \
+             every view shares it (docs/webview.md § Processes)",
+            st.node
+        );
+        if st.fit.get().is_some() {
+            st.fit.set(Some(FIT_MIN));
+            day_gtk::emit(st.node, Report::Fit.event(FIT_MIN.to_string()));
+        }
     });
     // Report the current URL back on every navigation so a bound text field follows.
     wv.connect_uri_notify(move |wv| {
@@ -202,9 +245,9 @@ fn make(_backend: &mut Gtk, p: &WebProps, id: NodeId) -> gtk4::Widget {
         // the document starts is cancelled and reported — so a rendered email can never
         // navigate the reading pane away, not even to a sibling file under the base. Only
         // the document's own load (the base itself, or about:blank without one) and
-        // fragment jumps within it proceed. The base lives in a cell the LoadHtml patch
-        // updates, keyed by the widget and dropped with it.
-        let base = state.base.clone();
+        // fragment jumps within it proceed. The base lives in the view's state, which the
+        // LoadHtml patch updates.
+        let st = state.clone();
         wv.connect_decide_policy(move |_wv, decision, dtype| {
             use webkit6::PolicyDecisionType;
             let uri = match dtype {
@@ -222,7 +265,7 @@ fn make(_backend: &mut Gtk, p: &WebProps, id: NodeId) -> gtk4::Widget {
             // The borrow ends before `emit`: the app may answer the event synchronously
             // with a new LoadHtml patch, whose `update` writes this same cell.
             let inside = {
-                let b = base.borrow();
+                let b = st.base.borrow();
                 uri == "about:blank"
                     || (!b.is_empty()
                         && (uri == *b
@@ -261,12 +304,31 @@ struct ViewState {
     node: NodeId,
     /// Document mode's live base URL, so a LoadHtml patch can move it and the policy
     /// closure sees the move.
-    base: Rc<RefCell<String>>,
+    base: RefCell<String>,
     /// Fit-content mode: the document's last reported height in points (`None` = a
-    /// filling view). What `measure` answers with.
+    /// filling view). What `measure` answers with; [`FIT_MIN`] until the first report.
     fit: Cell<Option<f64>>,
-    /// When the view was created, for the debug log's "first height after N ms".
-    born: std::time::Instant,
+    /// Fit-content mode: the running kinetic-scroll ramp on the outer scroll, if any, so a
+    /// new touch stops it.
+    fling: Cell<Option<gtk4::glib::SourceId>>,
+}
+
+/// The process anchor every view is created `related` to (see `make`): a view that is
+/// never shown and never freed. Leaked on purpose — `ManuallyDrop` in a `const`
+/// thread-local means no destructor runs for it at thread exit, when GTK and WebKit may
+/// already be torn down (the hazard `VIEWS` documents). Built OUTSIDE the cell's borrow:
+/// no WebKit call runs under a `RefCell` borrow.
+fn anchor() -> webkit6::WebView {
+    if let Some(a) = ANCHOR.with(|a| a.borrow().as_ref().map(|a| (**a).clone())) {
+        return a;
+    }
+    let a = webkit6::WebView::new();
+    a.connect_web_process_terminated(|_wv, reason| {
+        log::warn!("day-piece-webview: the shared web process terminated ({reason:?})");
+    });
+    a.load_html("<!doctype html><title>day</title>", None);
+    ANCHOR.with(|slot| *slot.borrow_mut() = Some(ManuallyDrop::new(a.clone())));
+    a
 }
 
 /// Fit-content mode (docs/webview.md): inject the height reporter and the no-scroll style,
@@ -282,51 +344,61 @@ fn install_fit(wv: &webkit6::WebView, ucm: &webkit6::UserContentManager, state: 
         &[],
         &[],
     ));
-    ucm.add_script(&webkit6::UserScript::new(
+    ucm.add_script(&webkit6::UserScript::for_world(
         FIT_SCRIPT,
         UserContentInjectedFrames::TopFrame,
         UserScriptInjectionTime::End,
+        FIT_WORLD,
         &[],
         &[],
     ));
-    ucm.register_script_message_handler(FIT_HANDLER, None);
     let st = state.clone();
     ucm.connect_script_message_received(Some(FIT_HANDLER), move |_ucm, value| {
+        // Only the reporter can post here (the handler lives in its world), but the value
+        // is still a measure of untrusted content: a non-finite number would loop layout,
+        // an absurd one would give it a mile-high leaf.
         let h = if value.is_number() {
             value.to_double()
         } else {
             value.to_str().parse().unwrap_or(0.0)
         };
-        let h = h.max(0.0);
-        if st.fit.get() == Some(h) {
+        if !h.is_finite() {
             return;
         }
-        if st.fit.get() == Some(0.0) {
-            log::debug!(
-                "day-piece-webview: fit-content view {:?} first height {h} pt after {} ms",
-                st.node,
-                st.born.elapsed().as_millis()
-            );
+        let h = h.clamp(FIT_MIN, FIT_MAX);
+        if st.fit.get() == Some(h) {
+            return;
         }
         st.fit.set(Some(h));
         day_gtk::emit(st.node, Report::Fit.event(h.to_string()));
     });
-    // Wheel and touchpad scrolling over the view: the page cannot scroll (its viewport is
-    // its content), so forward the delta to the nearest GtkScrolledWindow above, the way
-    // GTK itself would have if WebKit did not claim the event first. Captured before
-    // WebKit's own controller sees it; the page keeps clicks, selection and keys.
+    ucm.register_script_message_handler(FIT_HANDLER, Some(FIT_WORLD));
+    // Wheel and touchpad scrolling over the view: the page cannot scroll vertically (its
+    // viewport is its content), so forward a vertical delta to the nearest real
+    // GtkScrolledWindow above, the way GTK itself would have if WebKit did not claim the
+    // event first. Captured before WebKit's own controller sees it; the page keeps clicks,
+    // selection, keys — and horizontal scrolling, which a wide table inside an
+    // `overflow-x: auto` box still needs. A touchpad flick continues as a fling on the outer
+    // adjustment (`decelerate`), since the scrolled window never sees the gesture itself.
     let scroll = gtk4::EventControllerScroll::new(
-        gtk4::EventControllerScrollFlags::VERTICAL | gtk4::EventControllerScrollFlags::KINETIC,
+        gtk4::EventControllerScrollFlags::BOTH_AXES | gtk4::EventControllerScrollFlags::KINETIC,
     );
     scroll.set_propagation_phase(gtk4::PropagationPhase::Capture);
     let weak = wv.downgrade();
-    scroll.connect_scroll(move |ctl, _dx, dy| {
+    let st = state.clone();
+    scroll.connect_scroll_begin(move |_ctl| stop_fling(&st));
+    let st = state.clone();
+    scroll.connect_scroll(move |ctl, dx, dy| {
+        if dx.abs() > dy.abs() {
+            return gtk4::glib::Propagation::Proceed;
+        }
         let Some(wv) = weak.upgrade() else {
             return gtk4::glib::Propagation::Proceed;
         };
-        let Some(sw) = enclosing_scrolled_window(wv.upcast_ref()) else {
+        let Some(sw) = enclosing_scroll(wv.upcast_ref()) else {
             return gtk4::glib::Propagation::Proceed;
         };
+        stop_fling(&st);
         let adj = sw.vadjustment();
         // GtkScrolledWindow's own wheel step: a discrete click moves page_size^(2/3).
         let step = if ctl.unit() == gtk4::gdk::ScrollUnit::Wheel {
@@ -337,14 +409,64 @@ fn install_fit(wv: &webkit6::WebView, ucm: &webkit6::UserContentManager, state: 
         adj.set_value(adj.value() + dy * step);
         gtk4::glib::Propagation::Stop
     });
+    let weak = wv.downgrade();
+    let st = state.clone();
+    scroll.connect_decelerate(move |_ctl, _vx, vy| {
+        let Some(sw) = weak
+            .upgrade()
+            .and_then(|wv| enclosing_scroll(wv.upcast_ref()))
+        else {
+            return;
+        };
+        start_fling(&st, sw.vadjustment(), vy);
+    });
     wv.add_controller(scroll);
 }
 
-/// The nearest `GtkScrolledWindow` above `w`, if any.
-fn enclosing_scrolled_window(w: &gtk4::Widget) -> Option<gtk4::ScrolledWindow> {
+/// Continue a touchpad flick on `adj` at `velocity` (pixels per ms, the sign of the scroll
+/// deltas — what `decelerate` hands over), decaying at GTK's friction until it is spent or
+/// the adjustment hits an end.
+fn start_fling(state: &Rc<ViewState>, adj: gtk4::Adjustment, velocity: f64) {
+    stop_fling(state);
+    if !velocity.is_finite() || velocity == 0.0 {
+        return;
+    }
+    let st = state.clone();
+    let v = Cell::new(velocity);
+    let id = gtk4::glib::timeout_add_local(FLING_FRAME, move || {
+        let dt = FLING_FRAME.as_secs_f64();
+        let vel = v.get() * (-FLING_FRICTION * dt).exp();
+        v.set(vel);
+        let before = adj.value();
+        adj.set_value(before + vel * dt * 1000.0);
+        let at_end = adj.value() == before;
+        if at_end || vel.abs() < 0.01 {
+            st.fling.set(None);
+            return gtk4::glib::ControlFlow::Break;
+        }
+        gtk4::glib::ControlFlow::Continue
+    });
+    state.fling.set(Some(id));
+}
+
+fn stop_fling(state: &Rc<ViewState>) {
+    if let Some(id) = state.fling.take() {
+        id.remove();
+    }
+}
+
+/// The nearest `GtkScrolledWindow` above `w` that actually scrolls — day's `scroll(..)`
+/// wrapper, a list's or a sidebar's — if any. day-gtk also wraps windows and split panes in
+/// scrolled windows whose only job is to break min-size propagation (both policies
+/// `External`, adjustments pinned at 0); a wheel forwarded to one of those would go
+/// nowhere, so they are skipped, and a fit view under no real scroll lets the event
+/// proceed instead of swallowing it.
+fn enclosing_scroll(w: &gtk4::Widget) -> Option<gtk4::ScrolledWindow> {
     let mut cur = w.parent();
     while let Some(p) = cur {
-        if let Ok(sw) = p.clone().downcast::<gtk4::ScrolledWindow>() {
+        if let Ok(sw) = p.clone().downcast::<gtk4::ScrolledWindow>()
+            && sw.policy().1 != gtk4::PolicyType::External
+        {
             return Some(sw);
         }
         cur = p.parent();
@@ -367,8 +489,8 @@ fn measure(_backend: &mut Gtk, h: &gtk4::Widget, p: day_spec::Proposal) -> day_s
 
 thread_local! {
     static VIEWS: RefCell<HashMap<usize, Rc<ViewState>>> = RefCell::new(HashMap::new());
-    /// The process anchor every view is created `related` to (see `make`).
-    static ANCHOR: RefCell<Option<webkit6::WebView>> = const { RefCell::new(None) };
+    /// The process anchor (see [`anchor`]); `ManuallyDrop` so thread exit never unrefs it.
+    static ANCHOR: RefCell<Option<ManuallyDrop<webkit6::WebView>>> = const { RefCell::new(None) };
 }
 
 /// A posted script message as text: a string as itself, anything else as its JSON
@@ -433,6 +555,12 @@ fn update(_backend: &mut Gtk, h: &gtk4::Widget, patch: &WebPatch) {
         WebPatch::LoadHtml { html, base } => {
             if let Some(state) = state_of(wv) {
                 *state.base.borrow_mut() = base.clone();
+                // A fit view drops to its floor for the new document rather than showing
+                // it at the old one's height until the first report lands.
+                if state.fit.get().is_some_and(|h| h != FIT_MIN) {
+                    state.fit.set(Some(FIT_MIN));
+                    day_gtk::emit(state.node, Report::Fit.event(FIT_MIN.to_string()));
+                }
             }
             wv.load_html(
                 html,

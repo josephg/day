@@ -89,18 +89,27 @@ web_view_html(doc)
 window.webkit.messageHandlers.day.postMessage({kind: "height", value: 812});
 ```
 
-The handler is registered under the name **`day`** in the page's main world on every view the
-piece creates, so a document never has to know whether anyone is listening; a string arrives
-as itself, any other value as its JSON text (`undefined`, a function or a cycle arrive as
-`null`). Messages are one-way and unanswered: the page keeps running, and a reply goes back
-through `eval`. Delivery is on the main thread through the same `Event::Custom` channel the
-other reports use, with the reserved `num = -2` (`MESSAGE_REPORT`; navigation is `0`, evals
-`≥ 1`, links `-1`, [fit-content heights](#fit-content-heights) `-3`), so an arm needs
-nothing beyond its engine's message hook. Gate on `message_support()`.
+The handler is registered under the name **`day`** in the page's main world — on a view whose
+app attached `.on_message` (a view without a listener exposes no
+`webkit.messageHandlers.day` at all); a string arrives as itself, any other value as its
+JSON text (`undefined`, a function or a cycle arrive as `null`). Messages are one-way and
+unanswered: the page keeps running, and a reply goes back through `eval`. Delivery is on
+the main thread through the same `Event::Custom` channel the other reports use, with the
+reserved `num = -2` (`Report::Message`; navigation is `0`, evals `≥ 1`, links `-1`,
+[fit-content heights](webview.md#fit-content-documents) `-3` — the `Report` enum in lib.rs
+is the one place these live), so an arm needs nothing beyond its engine's message hook.
+Gate on `message_support()`.
+
+**The payload is page content.** For a `web_view_html` document — an email, anything
+fetched — whatever calls `postMessage` is the document's own script, so `on_message` must
+treat the text as untrusted input: parse it, bound it, never let it name a file or a
+command. The piece's own fit-content channel (`dayFit`) is kept out of the page's reach
+for the same reason — it runs in an isolated script world, so the page can neither see nor
+spoof it.
 
 | backend | channel | status |
 |---|---|---|
-| GTK | `WebKitUserContentManager`: `register_script_message_handler("day")` + `script-message-received::day` — one manager per view (it is a construct-only property), the `JSCValue` read as string or JSON | **shipped** (linux-gtk, verified in fastmail-native) |
+| GTK | `WebKitUserContentManager`: `script-message-received::day` connected first, then `register_script_message_handler("day")` (so no message finds an unconnected handler) — one manager per view (it is a construct-only property), the `JSCValue` read as string or JSON | **shipped** (linux-gtk, verified in fastmail-native) |
 | AppKit / UIKit | `WKUserContentController.addScriptMessageHandler(_:name:)` on the view's configuration, a `WKScriptMessageHandler` delegate; the same `window.webkit.messageHandlers.day` spelling | not written (no Mac to run it); a listener logs one warning |
 | Android | `addJavascriptInterface` (a `@JavascriptInterface` object named `day`, so the spelling differs: `day.postMessage(...)`) | not written |
 | Qt | `QWebChannel` over `qt.webChannelTransport`, or a `runJavaScript` poll | not written |
