@@ -58,9 +58,11 @@ pub enum Step {
         timeout_secs: Option<f64>,
     },
     WaitIdle,
-    /// Programmatic scroll (docs/scroll.md §dayscript). With `edge`/`x`+`y`, `id` must name a
-    /// `scroll` piece; with neither, `id` names ANY element and its nearest enclosing scroll
-    /// reveals it. Unanimated, so the next step sees the settled position.
+    /// Programmatic scroll (docs/scroll.md §dayscript). With `edge`, `x`/`y` (absolute) or
+    /// `dx`/`dy` (relative to the current position — a wheel's worth), `id` must name a
+    /// `scroll` piece; with none of them, `id` names ANY element and its nearest enclosing
+    /// scroll reveals it. Unanimated, so the next step sees the settled position; the
+    /// scroll's `on_scroll` listeners hear it at the next drain, as they would a gesture.
     ScrollTo {
         id: String,
         /// `"top"` | `"bottom"` | `"leading"` | `"trailing"`.
@@ -70,6 +72,10 @@ pub enum Step {
         x: Option<f64>,
         #[serde(default)]
         y: Option<f64>,
+        #[serde(default)]
+        dx: Option<f64>,
+        #[serde(default)]
+        dy: Option<f64>,
     },
     Tap {
         id: String,
@@ -1544,8 +1550,31 @@ fn exec(step: Step) -> Reply {
                     ))
                 }
             }
-            Step::ScrollTo { id, edge, x, y } => {
+            Step::ScrollTo {
+                id,
+                edge,
+                x,
+                y,
+                dx,
+                dy,
+            } => {
                 let node = find(&id)?;
+                // A relative step: the current offset plus the delta (clamped by the
+                // toolkit, like any Offset).
+                let (x, y) = if dx.is_some() || dy.is_some() {
+                    let Some(st) = with_tree(|t| t.scroll_state(node)) else {
+                        return Err(Reply::fail(
+                            format!("scroll_to: {id:?} is not a realized scroll piece"),
+                            true,
+                        ));
+                    };
+                    (
+                        Some(st.offset.x + dx.unwrap_or(0.0)),
+                        Some(st.offset.y + dy.unwrap_or(0.0)),
+                    )
+                } else {
+                    (x, y)
+                };
                 let target = match (edge.as_deref(), x, y) {
                     (Some("top"), _, _) => day_core::ScrollTarget::Top,
                     (Some("bottom"), _, _) => day_core::ScrollTarget::Bottom,

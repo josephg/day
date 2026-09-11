@@ -22,8 +22,8 @@ use day_spec::props::*;
 use day_spec::sidetable::SideTable;
 use day_spec::{
     A11yProps, AnimSpec, Animatable, Builtin, Cap, Cursor, Curve, DrawOp, Event, EventSink, Font,
-    ListSource, NodeId, PieceKind, Platform, Proposal, RawHandle, Rect, Registry, Renderer, Size,
-    Support, Toolkit, Transform, TreeSource, ffi_guard, kinds, props_of,
+    ListSource, NodeId, PieceKind, Platform, Point, Proposal, RawHandle, Rect, Registry, Renderer,
+    Size, Support, Toolkit, Transform, TreeSource, ffi_guard, kinds, props_of,
 };
 
 pub type Handle = gtk4::Widget;
@@ -824,6 +824,45 @@ pub fn emit(id: NodeId, ev: Event) {
     let sink = SINK.with(|s| s.borrow().clone());
     if let Some(sink) = sink {
         sink(id, ev);
+    }
+}
+
+/// Report a scrolled window's position as [`Event::ScrollChanged`] (docs/scroll.md § Reading
+/// the position). GTK's adjustments notify per pixel — `value-changed` fires for every step
+/// of a wheel's kinetic ramp — so the report is coalesced to one per frame: the first
+/// notification arms a tick callback, later ones in the same frame are absorbed, and the
+/// callback emits the adjustments' CURRENT values once. `page-size` and `upper` are hooked
+/// too: a natively resized viewport or content (a `list`'s rows, whose extent GTK owns)
+/// shows a different slice at the same offset, and one channel should carry every cause.
+/// Enqueue-only through `emit` (§8.3); day-core also reports programmatic scrolls itself, so
+/// a `scroll_to` yields two identical reports the listener de-duplicates.
+fn hook_scroll_reports(sw: &gtk4::ScrolledWindow, id: NodeId) {
+    let pending = Rc::new(std::cell::Cell::new(false));
+    let sw2 = sw.clone();
+    let arm: Rc<dyn Fn()> = Rc::new(move || {
+        if pending.replace(true) {
+            return;
+        }
+        let pending = pending.clone();
+        sw2.add_tick_callback(move |sw, _clock| {
+            pending.set(false);
+            emit(
+                id,
+                Event::ScrollChanged(Point::new(
+                    sw.hadjustment().value(),
+                    sw.vadjustment().value(),
+                )),
+            );
+            gtk4::glib::ControlFlow::Break
+        });
+    });
+    for adj in [sw.hadjustment(), sw.vadjustment()] {
+        let a = arm.clone();
+        adj.connect_value_changed(move |_| a());
+        let a = arm.clone();
+        adj.connect_page_size_notify(move |_| a());
+        let a = arm.clone();
+        adj.connect_upper_notify(move |_| a());
     }
 }
 
@@ -2614,7 +2653,10 @@ impl Toolkit for Gtk {
             // gtk_widget_measure reports baselines itself (docs/baseline.md).
             | Cap::BaselineAlignment
             // AdwOverlaySplitView with the sidebar at the end (docs/inspector.md).
-            | Cap::Inspector => Support::Native,
+            | Cap::Inspector
+            // Scrolled windows report their adjustments, one event per frame
+            // (`hook_scroll_reports`, docs/scroll.md § Reading the position).
+            | Cap::ScrollReports => Support::Native,
             // A topmost child of the window's root Fixed — not a system modal (docs/cover.md).
             Cap::Cover => Support::Emulated,
             _ => Support::Unsupported,
@@ -2928,6 +2970,7 @@ impl Toolkit for Gtk {
                 // BEHIND the viewport (e.g. a gradient backdrop in a zstack) must show through.
                 scroll_transparent_css();
                 sw.add_css_class("day-scroll");
+                hook_scroll_reports(&sw, id);
                 sw.upcast()
             }
             Some(Builtin::Label) => {
@@ -3450,6 +3493,9 @@ impl Toolkit for Gtk {
                 sw.set_child(Some(&listview));
                 sw.set_vexpand(true);
                 let vadj = sw.vadjustment();
+                // The row rail's position reaches the app the same way a `scroll`'s does
+                // (docs/list.md § Reading the position).
+                hook_scroll_reports(&sw, id);
                 let host: Handle = sw.upcast();
                 host_key.set(widget_key(&host));
                 if p.reorderable {
@@ -4608,6 +4654,15 @@ impl Toolkit for Gtk {
             target.origin.x,
             target.origin.x + target.size.width,
         );
+    }
+
+    fn scroll_offset(&mut self, h: &Handle) -> Point {
+        // A `scroll` piece and a `list` host are both scrolled windows; the adjustments'
+        // values are the viewport origin in content space (docs/scroll.md).
+        match h.downcast_ref::<gtk4::ScrolledWindow>() {
+            Some(sw) => Point::new(sw.hadjustment().value(), sw.vadjustment().value()),
+            None => Point::ZERO,
+        }
     }
 
     fn focus(&mut self, h: &Handle, _node: NodeId, focused: bool) {

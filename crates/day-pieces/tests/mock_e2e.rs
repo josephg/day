@@ -78,6 +78,12 @@ fn boot_splittable(size: Size, root: impl FnOnce() -> AnyPiece + 'static) -> Moc
     probe
 }
 
+/// The laid-out frame of the element with dayscript id `id` (relative to its native parent).
+fn with_tree_frame(_probe: &MockProbe, id: &str) -> day_spec::Rect {
+    day_core::with_tree(|t| t.find_by_id(id).and_then(|n| t.node_frame(n)))
+        .unwrap_or_else(|| panic!("{id} has no frame"))
+}
+
 fn node_id(probe: &MockProbe, kind: &str, index: usize) -> NodeId {
     let found = probe.find_by_kind(kind);
     NodeId(found[index].1.node)
@@ -3989,6 +3995,134 @@ fn scroll_target_signal_drives_offset() {
     flush_sync();
     let y = probe.find_by_kind("day.scroll")[0].1.scroll_offset.y;
     assert!(y > 123.0, "revealing row 90 scrolled further down: {y}");
+}
+
+#[test]
+fn scroll_state_follows_programmatic_scrolls_and_layout() {
+    // The read side of `scroll_target` (docs/scroll.md § Reading the position): every
+    // programmatic scroll is reported by day-core as `ScrollChanged`, so the bound signal
+    // follows without the toolkit's help; the first layout reports too (content size).
+    let jump: Signal<Option<ScrollTarget>> = Signal::new(None);
+    let state: Signal<ScrollState> = Signal::new(ScrollState::default());
+    let heard = Rc::new(RefCell::new(Vec::<Point>::new()));
+    let (jump2, heard2) = (jump, heard.clone());
+    let probe = boot(move || {
+        scroll(column(PieceVec(
+            (0..100)
+                .map(|i| label(format!("row {i}")).id(format!("st-row-{i}")).any())
+                .collect(),
+        )))
+        .scroll_target(jump2)
+        .scroll_state(state)
+        .on_scroll(move |st| heard2.borrow_mut().push(st.offset))
+        .any()
+    });
+    day_core::pump_events();
+    let w = probe.find_by_kind("day.scroll")[0].1.clone();
+    let st = state.get_untracked();
+    assert_eq!(
+        st.viewport, w.frame.size,
+        "viewport is the scroll's laid-out frame"
+    );
+    assert_eq!(
+        st.content, w.scroll_content,
+        "content is the size ScrollLayout reported"
+    );
+    assert_eq!(st.offset, Point::ZERO);
+    assert_eq!(heard.borrow().len(), 1, "one report for the first layout");
+
+    jump.set(Some(ScrollTarget::Offset(Point::new(0.0, 123.0))));
+    flush_sync();
+    day_core::pump_events();
+    assert_eq!(
+        state.get_untracked().offset.y,
+        123.0,
+        "the signal follows the offset"
+    );
+    assert_eq!(
+        state.get_untracked().visible_rect(),
+        Rect::new(0.0, 123.0, w.frame.size.width, w.frame.size.height)
+    );
+    assert_eq!(heard.borrow().last().copied(), Some(Point::new(0.0, 123.0)));
+
+    // A toolkit's own report (the user scrolling) rides the same handler.
+    let node = node_id(&probe, "day.scroll", 0);
+    probe.emit(node, Event::ScrollChanged(Point::new(0.0, 40.0)));
+    assert_eq!(state.get_untracked().offset.y, 40.0);
+}
+
+#[test]
+fn on_frame_reports_a_child_in_its_scrolls_content_space() {
+    // `on_frame` (docs/scroll.md): the card's frame in the enclosing scroll's content space,
+    // re-reported when something above it grows and moves it.
+    let frame: Signal<Option<Rect>> = Signal::new(None);
+    let extra = Signal::new(false);
+    let probe = boot(move || {
+        scroll(column((
+            column(()).height(100.0),
+            when(move || extra.get(), || label("an extra row").id("extra")),
+            label("card")
+                .on_frame(move |r| frame.set(Some(r)))
+                .id("framed"),
+        )))
+        .any()
+    });
+    day_core::pump_events();
+    let first = frame
+        .get_untracked()
+        .expect("reported after the first layout");
+    assert_eq!(
+        first.origin.y, 100.0,
+        "sits under the 100 pt spacer: {first:?}"
+    );
+    assert!(first.size.height > 0.0);
+    // The native frame is relative to the column (a native container); the report is in
+    // the scroll's space, which is the same here because the column sits at its origin.
+    let native = probe.widget(probe.find_by_kind("day.label")[0].0).frame;
+    assert_eq!(native.origin.y, first.origin.y);
+
+    // A row appears above: the card moves down and says so; the offset is untouched.
+    batch(|| extra.set(true));
+    flush_sync();
+    day_core::pump_events();
+    let moved = frame.get_untracked().unwrap();
+    let extra_h = with_tree_frame(&probe, "extra").size.height;
+    assert!(extra_h > 0.0);
+    assert_eq!(
+        moved.origin.y,
+        100.0 + extra_h,
+        "moved by the new row's height: {moved:?}"
+    );
+    let st = day_core::with_tree(|t| {
+        t.scroll_state(day_core::id_to_rnode(node_id(&probe, "day.scroll", 0)))
+    });
+    assert!(
+        st.unwrap().visible_rect().intersects(&moved),
+        "still inside the viewport"
+    );
+}
+
+#[test]
+fn list_on_scroll_reports_the_row_rail() {
+    // The list's report: the toolkit's offset, the node's frame as the viewport, and the
+    // rows' extent under a uniform pitch (docs/list.md § Reading the position).
+    let seen: Signal<Option<ScrollState>> = Signal::new(None);
+    let probe = boot(move || {
+        list(
+            items(|| (0..50).collect::<Vec<u32>>(), |i| *i as u64),
+            |row: ItemSlot<u32, u64>| label(move || row.get().to_string()),
+        )
+        .row_height(RowHeight::Uniform(40.0))
+        .on_scroll(move |st| seen.set(Some(st)))
+        .any()
+    });
+    let host = node_id(&probe, "day.list", 0);
+    probe.emit(host, Event::ScrollChanged(Point::new(0.0, 80.0)));
+    let st = seen.get_untracked().expect("the list reported");
+    assert_eq!(st.offset.y, 80.0);
+    assert_eq!(st.content.height, 50.0 * 40.0, "rows × pitch");
+    assert_eq!(st.viewport, probe.find_by_kind("day.list")[0].1.frame.size);
+    assert_eq!((st.offset.y / 40.0) as usize, 2, "first visible row");
 }
 
 #[test]

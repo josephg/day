@@ -406,6 +406,23 @@ fn op_on_tap(f: impl Fn() + 'static) -> impl FnOnce(Build) -> Build {
     }
 }
 
+fn op_on_frame(f: impl Fn(day_spec::Rect) + 'static) -> impl FnOnce(Build) -> Build {
+    move |inner| {
+        Box::new(move |cx| {
+            let n = inner(cx);
+            with_tree(|t| t.report_frames(n));
+            cx.on(n, move |ev| {
+                if matches!(ev, Event::FrameChanged(_))
+                    && let Some(rect) = with_tree(|t| t.frame_in_scroll(n))
+                {
+                    f(rect);
+                }
+            });
+            n
+        })
+    }
+}
+
 fn op_on_tap_at(f: impl Fn(day_spec::Point) + 'static) -> impl FnOnce(Build) -> Build {
     move |inner| {
         Box::new(move |cx| {
@@ -967,6 +984,9 @@ impl<P: Piece> Decorated<P> {
     pub fn on_tap(self, f: impl Fn() + 'static) -> Self {
         self.push(op_on_tap(f))
     }
+    pub fn on_frame(self, f: impl Fn(day_spec::Rect) + 'static) -> Self {
+        self.push(op_on_frame(f))
+    }
     pub fn on_tap_at(self, f: impl Fn(day_spec::Point) + 'static) -> Self {
         self.push(op_on_tap_at(f))
     }
@@ -1214,6 +1234,18 @@ pub trait Decorate: Piece + Sized {
     /// Fire when this piece is tapped (bounding-box; shapes override with path-precise testing).
     fn on_tap(self, f: impl Fn() + 'static) -> Decorated<Self> {
         Decorated::new(self).on_tap(f)
+    }
+
+    /// Hear where this piece is (docs/scroll.md § Reading the position): `f` runs with the
+    /// piece's frame in the content space of its nearest enclosing `scroll` — the space
+    /// [`ScrollState::visible_rect`](day_core::ScrollState::visible_rect) is in — or of the
+    /// window when no scroll encloses it, whenever layout moves or resizes it (a card above
+    /// growing moves this one; the report follows). Reported from layout, queue-only (§8.3),
+    /// so it arrives at the drain after the layout that placed it, like a canvas's
+    /// `FrameChanged`. Combine with `scroll(..).on_scroll(..)` to know whether the piece is
+    /// on screen; the frame alone says nothing about the viewport.
+    fn on_frame(self, f: impl Fn(day_spec::Rect) + 'static) -> Decorated<Self> {
+        Decorated::new(self).on_frame(f)
     }
 
     /// [`on_tap`](Self::on_tap), told WHERE — the point in the piece's own coordinate space,

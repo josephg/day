@@ -480,6 +480,7 @@ pub struct List<S: RowSource> {
     swipe_leading: Option<SwipeProvider>,
     swipe_trailing: Option<SwipeProvider>,
     separators: Option<bool>,
+    on_scroll: Vec<Rc<dyn Fn(day_core::ScrollState)>>,
 }
 
 /// The full-set selection callback, aliased for the field above.
@@ -585,6 +586,7 @@ where
         swipe_leading: None,
         swipe_trailing: None,
         separators: None,
+        on_scroll: Vec::new(),
     }
 }
 
@@ -747,6 +749,19 @@ impl<S: RowSource + 'static> List<S> {
     /// old hand-drawn hairline there; rows separate by their pitch.
     pub fn separators(mut self, on: bool) -> Self {
         self.separators = Some(on);
+        self
+    }
+
+    /// Hear where the native list's own scroller is (docs/list.md § Reading the position):
+    /// `f` runs with a [`day_core::ScrollState`] whose `offset` and `viewport` are the row
+    /// rail's, and whose `content` is the rows' extent — `rows × pitch` under
+    /// [`RowHeight::Uniform`], the viewport otherwise (an `Automatic` list's extent is the
+    /// host's alone). With a uniform pitch the visible rows are
+    /// `offset.y / pitch ..= (offset.y + viewport.height) / pitch`, which is what a list
+    /// that prefetches for the rows on screen needs. Reported by the toolkits that answer
+    /// `Cap::ScrollReports`, at most once per frame, at an event drain.
+    pub fn on_scroll(mut self, f: impl Fn(day_core::ScrollState) + 'static) -> Self {
+        self.on_scroll.push(Rc::new(f));
         self
     }
 }
@@ -1034,6 +1049,36 @@ impl<S: RowSource + 'static> Piece for List<S> {
                 move || trigger.track(),
                 move |_: &(), _| list_scroll_to_end(node),
             );
+        }
+
+        // The row rail's position (docs/list.md § Reading the position): the toolkit's
+        // offset, the node's frame as the viewport, the rows' extent as the content.
+        if !self.on_scroll.is_empty() {
+            let listeners = std::mem::take(&mut self.on_scroll);
+            let conn = conn.clone();
+            let pitch = match self.row_height {
+                RowHeight::Uniform(h) => Some(h),
+                RowHeight::Automatic => None,
+            };
+            cx.on(node, move |ev| {
+                if let Event::ScrollChanged(offset) = ev {
+                    let viewport = with_tree(|t| t.node_frame(node))
+                        .map(|f| f.size)
+                        .unwrap_or_default();
+                    let content = match pitch {
+                        Some(h) => day_spec::Size::new(viewport.width, h * conn.len() as f64),
+                        None => viewport,
+                    };
+                    let st = day_core::ScrollState {
+                        offset: *offset,
+                        viewport,
+                        content,
+                    };
+                    for f in &listeners {
+                        f(st);
+                    }
+                }
+            });
         }
 
         // Programmatic scroll-to-row: every `Some(row)` write scrolls that row into view
@@ -1425,6 +1470,7 @@ pub trait ListBuilder<S: RowSource + 'static>: Sized {
     fn swipe_leading(self, provider: impl Fn(usize) -> Vec<SwipeAction> + 'static) -> Self;
     fn swipe_trailing(self, provider: impl Fn(usize) -> Vec<SwipeAction> + 'static) -> Self;
     fn separators(self, on: bool) -> Self;
+    fn on_scroll(self, f: impl Fn(day_core::ScrollState) + 'static) -> Self;
 }
 
 impl<S: RowSource + 'static> ListBuilder<S> for List<S> {
@@ -1482,6 +1528,9 @@ impl<S: RowSource + 'static> ListBuilder<S> for List<S> {
     fn separators(self, on: bool) -> Self {
         List::separators(self, on)
     }
+    fn on_scroll(self, f: impl Fn(day_core::ScrollState) + 'static) -> Self {
+        List::on_scroll(self, f)
+    }
 }
 
 impl<S: RowSource + 'static, Inner: ListBuilder<S> + Piece> ListBuilder<S> for Decorated<Inner> {
@@ -1538,6 +1587,9 @@ impl<S: RowSource + 'static, Inner: ListBuilder<S> + Piece> ListBuilder<S> for D
     }
     fn separators(self, on: bool) -> Self {
         self.map_inner(|inner_piece| inner_piece.separators(on))
+    }
+    fn on_scroll(self, f: impl Fn(day_core::ScrollState) + 'static) -> Self {
+        self.map_inner(|inner_piece| inner_piece.on_scroll(f))
     }
 }
 

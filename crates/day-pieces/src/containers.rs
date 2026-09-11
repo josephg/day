@@ -415,6 +415,7 @@ pub struct Scroll<P: Piece> {
     child: P,
     axis: Axis,
     target: Option<Signal<Option<day_core::ScrollTarget>>>,
+    on_scroll: Vec<Rc<dyn Fn(ScrollState)>>,
 }
 
 pub fn scroll<P: Piece>(child: P) -> Scroll<P> {
@@ -422,6 +423,7 @@ pub fn scroll<P: Piece>(child: P) -> Scroll<P> {
         child,
         axis: Axis::Vertical,
         target: None,
+        on_scroll: Vec::new(),
     }
 }
 
@@ -451,6 +453,30 @@ impl<P: Piece> Scroll<P> {
         self.target = Some(sig);
         self
     }
+
+    /// Hear where the viewport is (docs/scroll.md § Reading the position): `f` runs with the
+    /// live [`ScrollState`] — offset, viewport, content — after the user scrolls (where the
+    /// toolkit reports it, `Cap::ScrollReports`), after every programmatic scroll, and when
+    /// layout changes the viewport or the content size; at most once per frame for a
+    /// gesture, and only ever at an event drain (§8.3), never inside the native callback.
+    /// Pair with [`Decorate::on_frame`](crate::Decorate::on_frame) on a child to know
+    /// whether that child is on screen: both speak the scroll's content space.
+    ///
+    /// ```ignore
+    /// scroll(cards).on_scroll(move |st| visible.set(st.visible_rect()));
+    /// ```
+    pub fn on_scroll(mut self, f: impl Fn(ScrollState) + 'static) -> Self {
+        self.on_scroll.push(Rc::new(f));
+        self
+    }
+
+    /// The same reports, kept in a signal: `sig` follows the scroll's [`ScrollState`]
+    /// (`set_if_changed`, so a duplicate report wakes nothing). Read it from any binding
+    /// that wants to track the position — the read side of
+    /// [`scroll_target`](Self::scroll_target).
+    pub fn scroll_state(self, sig: Signal<ScrollState>) -> Self {
+        self.on_scroll(move |st| sig.set_if_changed(st))
+    }
 }
 
 impl<P: Piece> Piece for Scroll<P> {
@@ -471,6 +497,23 @@ impl<P: Piece> Piece for Scroll<P> {
         cx.under(node, |cx| {
             let _ = self.child.build(cx);
         });
+        if !self.on_scroll.is_empty() {
+            let listeners = self.on_scroll;
+            cx.on(node, move |ev| {
+                if let day_spec::Event::ScrollChanged(offset) = ev {
+                    // The event carries the offset the toolkit saw when it reported; the
+                    // rest of the state (viewport, content) is the tree's, current as of
+                    // the last layout.
+                    let Some(mut st) = with_tree(|t| t.scroll_state(node)) else {
+                        return;
+                    };
+                    st.offset = *offset;
+                    for f in &listeners {
+                        f(st);
+                    }
+                }
+            });
+        }
         if let Some(sig) = self.target {
             watch(
                 move || sig.get(),
@@ -602,6 +645,8 @@ pub trait ScrollBuilder: Sized {
     fn horizontal(self) -> Self;
     fn axis(self, axis: Axis) -> Self;
     fn scroll_target(self, sig: Signal<Option<day_core::ScrollTarget>>) -> Self;
+    fn on_scroll(self, f: impl Fn(ScrollState) + 'static) -> Self;
+    fn scroll_state(self, sig: Signal<ScrollState>) -> Self;
 }
 
 impl<P: Piece> ScrollBuilder for Scroll<P> {
@@ -614,6 +659,12 @@ impl<P: Piece> ScrollBuilder for Scroll<P> {
     fn scroll_target(self, sig: Signal<Option<day_core::ScrollTarget>>) -> Self {
         Scroll::scroll_target(self, sig)
     }
+    fn on_scroll(self, f: impl Fn(ScrollState) + 'static) -> Self {
+        Scroll::on_scroll(self, f)
+    }
+    fn scroll_state(self, sig: Signal<ScrollState>) -> Self {
+        Scroll::scroll_state(self, sig)
+    }
 }
 
 impl<Inner: ScrollBuilder + Piece> ScrollBuilder for Decorated<Inner> {
@@ -625,6 +676,12 @@ impl<Inner: ScrollBuilder + Piece> ScrollBuilder for Decorated<Inner> {
     }
     fn scroll_target(self, sig: Signal<Option<day_core::ScrollTarget>>) -> Self {
         self.map_inner(|inner_piece| inner_piece.scroll_target(sig))
+    }
+    fn on_scroll(self, f: impl Fn(ScrollState) + 'static) -> Self {
+        self.map_inner(|inner_piece| inner_piece.on_scroll(f))
+    }
+    fn scroll_state(self, sig: Signal<ScrollState>) -> Self {
+        self.map_inner(|inner_piece| inner_piece.scroll_state(sig))
     }
 }
 

@@ -107,3 +107,4 @@ An app branches on this rather than on the target name.
 | `Inspector` | N | – | N | N | N | – | – | – |
 | `Cursor` | N | E | N | E | E | N | – | N |
 | `FontList` | N | N | N | N | N | N | N | E |
+| `ScrollReports` | – | – | N | – | – | – | – | N |

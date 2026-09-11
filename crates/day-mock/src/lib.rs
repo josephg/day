@@ -671,6 +671,9 @@ impl Toolkit for MockToolkit {
             Cap::Cursor => Support::Native,
             // A fixed two-family list (`font_families` below) — composed, not read.
             Cap::FontList => Support::Emulated,
+            // Programmatic scrolls are reported by day-core on every backend; a test plays
+            // the user with `MockProbe::emit(node, Event::ScrollChanged(..))`.
+            Cap::ScrollReports => Support::Native,
             // The mock answers `first_baseline` from its synthetic metrics (see below).
             Cap::BaselineAlignment => Support::Native,
             // The mock records the text-area attributes (probe-visible), so it "supports" all three.

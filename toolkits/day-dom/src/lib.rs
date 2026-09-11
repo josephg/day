@@ -1294,6 +1294,8 @@ impl Toolkit for Dom {
             // grow a tab bar as the viewport narrows (docs/navigation.md).
             Cap::NavTabsAdaptive => Support::Emulated,
             Cap::Appearance | Cap::Dialogs | Cap::Animation => Support::Native,
+            // Scroll containers subscribe to the `scroll` event (`ev::SCROLL`).
+            Cap::ScrollReports => Support::Native,
             // The browser's file input and download ARE its file dialogs; bytes ride the
             // `web_files` store instead of a filesystem (docs/files.md).
             Cap::FileDialogs => Support::Native,

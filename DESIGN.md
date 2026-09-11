@@ -1168,6 +1168,15 @@ hop needed a dedicated protocol — this cannot be retrofitted after the spec fr
   `scroll(child).scroll_target(signal)` builder (a `Signal<Option<ScrollTarget>>` of
   Top/Bottom/Leading/Trailing/Offset/Id), `TreeOps::{scroll_to_target, scroll_reveal}` composing
   reveal-rects in core, and the dayscript `scroll_to` step — one rail, every backend.
+- **Reading it back** (2026-09, [docs/scroll.md](docs/scroll.md) § Reading the position):
+  `scroll(child).on_scroll(..)` / `.scroll_state(Signal<ScrollState>)` hear
+  `Event::ScrollChanged` — emitted by the toolkits that answer `Cap::ScrollReports` (GTK,
+  web-dom, mock) as the user scrolls, one report per frame, and by day-core itself after every
+  programmatic scroll and whenever layout changes a scroll's viewport or content, so one
+  channel carries every cause on every backend. `Decorate::on_frame(..)` is the child's half:
+  its frame in the enclosing scroll's content space, re-reported from `place_node` when it
+  moves (`TreeOps::report_frames`/`frame_in_scroll`). A `list` has the same `on_scroll` for
+  its native row rail.
 - On content relayout the offset is preserved, clamped to the new extent.
 - **v1 restrictions, linted:** same-axis nested scrolls and `list`-inside-`scroll` are
   unsupported (`day lint` rule); cross-axis gesture arbitration is documented post-MVP work.

@@ -124,9 +124,15 @@ impl<B: Toolkit> LayoutOps for EngineCx<'_, B> {
             return;
         };
         // Cache for scroll_to_target (§7.6): edge targets need content-minus-viewport math.
+        let changed = n.scroll_content != Some(content);
         n.scroll_content = Some(content);
         let Some(h) = n.handle.clone() else { return };
         self.tree.toolkit.set_scroll_content(&h, content);
+        if changed {
+            // Queue-only (§8.3): a scroll listener re-derives what is in view against the
+            // new extent at the next drain (docs/scroll.md § Reading the position).
+            self.tree.report_scroll(current);
+        }
     }
 
     #[cfg(debug_assertions)]
@@ -273,16 +279,21 @@ pub(crate) fn place_node<B: Toolkit>(
                     let anim = tree.resolve_anim(node);
                     tree.toolkit.set_frame(&h, abs, anim.as_ref());
                 }
-                if tree
-                    .node(node)
-                    .map(|n| n.kind == day_spec::kinds::CANVAS)
-                    .unwrap_or(false)
-                {
-                    // Queue-only (§8.3): canvases re-record against the new size after layout.
-                    crate::tree::enqueue_event(
-                        crate::tree::rnode_to_id(node),
-                        day_spec::Event::FrameChanged(abs.size),
-                    );
+                match tree.node(node).map(|n| n.kind) {
+                    Some(day_spec::kinds::CANVAS) => {
+                        // Queue-only (§8.3): canvases re-record against the new size after
+                        // layout.
+                        crate::tree::enqueue_event(
+                            crate::tree::rnode_to_id(node),
+                            day_spec::Event::FrameChanged(abs.size),
+                        );
+                    }
+                    Some(day_spec::kinds::SCROLL) => {
+                        // A resized viewport shows a different slice of the content: report
+                        // it as a scroll so one listener covers every cause (docs/scroll.md).
+                        tree.report_scroll(node);
+                    }
+                    _ => {}
                 }
             }
         }
@@ -304,8 +315,35 @@ pub(crate) fn place_node<B: Toolkit>(
                     .unwrap_or(false)
         })
         .unwrap_or(false);
-    if let Some(n) = tree.node_mut(node) {
-        n.last_native_frame = Some(abs);
+    let wants_frame_report = tree
+        .node_mut(node)
+        .map(|n| {
+            n.last_native_frame = Some(abs);
+            n.frame_report.is_some()
+        })
+        .unwrap_or(false);
+    if wants_frame_report {
+        // `on_frame` (docs/scroll.md): the frame that matters to a listener is the one in its
+        // enclosing scroll's content space — ancestors are placed before their children, so
+        // theirs are current here. Diffed against the last report, queue-only (§8.3). Canvases
+        // report their own resize above; a canvas that also asked for this gets one event per
+        // cause, which its re-record de-duplicates by content.
+        let now = tree.content_frame(node).map(|(_, r)| r);
+        let last = tree.node(node).and_then(|n| n.frame_report).flatten();
+        let moved = match (now, last) {
+            (Some(a), Some(b)) => !a.approx_eq(&b, 0.25),
+            (Some(_), None) => true,
+            (None, _) => false,
+        };
+        if moved {
+            if let Some(n) = tree.node_mut(node) {
+                n.frame_report = Some(now);
+            }
+            crate::tree::enqueue_event(
+                crate::tree::rnode_to_id(node),
+                day_spec::Event::FrameChanged(abs.size),
+            );
+        }
     }
     if relayout_cells {
         for key in tree.list_cell_keys(node) {

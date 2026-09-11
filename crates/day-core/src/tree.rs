@@ -107,6 +107,11 @@ pub struct NodeData<H> {
     /// Scroll-content size reported by `ScrollLayout` (§7.6) — SCROLL nodes only. Cached so
     /// `scroll_to_target` can compose edge targets (bottom = content minus viewport).
     pub scroll_content: Option<Size>,
+    /// `TreeOps::report_frames` was called: layout compares the node's frame in its enclosing
+    /// scroll's content space against the last one reported here and enqueues
+    /// `Event::FrameChanged` when it differs (`Some(Rect::ZERO)`-like sentinel until the first
+    /// report: `None` means "not asked").
+    pub frame_report: Option<Option<Rect>>,
     /// Node-scoped implicit animation (`.animation(anim)`, §8.4): when set, this node's property
     /// patches and frame changes animate even outside a `with_animation`. The ambient animation
     /// (`with_animation`) takes precedence when both are present.
@@ -219,6 +224,7 @@ impl<B: Toolkit> Tree<B> {
             needs_measure: true,
             last_native_frame: None,
             scroll_content: None,
+            frame_report: None,
             implicit_anim: None,
             tweaked: false,
             is_boundary: true,
@@ -264,6 +270,7 @@ impl<B: Toolkit> Tree<B> {
             needs_measure: true,
             last_native_frame: None,
             scroll_content: None,
+            frame_report: None,
             implicit_anim: None,
             tweaked: false,
             is_boundary: true,
@@ -279,6 +286,61 @@ impl<B: Toolkit> Tree<B> {
     }
     pub(crate) fn node_mut(&mut self, n: RNode) -> Option<&mut NodeData<B::Handle>> {
         self.nodes.get_mut(n)
+    }
+
+    /// `node`'s frame accumulated through its realized ancestors up to (not including) its
+    /// nearest enclosing SCROLL: the scroll's content space, or the window's when none
+    /// encloses it. The scroll (if any) comes back with the rect; `None` before layout.
+    pub(crate) fn content_frame(&self, node: RNode) -> Option<(Option<RNode>, Rect)> {
+        let n = self.nodes.get(node)?;
+        let mut rect = n.last_native_frame?;
+        let mut anc = n.parent;
+        loop {
+            let Some(a) = self.nodes.get(anc) else {
+                return Some((None, rect)); // walked off the root: window space
+            };
+            if a.kind == kinds::SCROLL {
+                return Some((Some(anc), rect));
+            }
+            if a.handle.is_some()
+                && let Some(f) = a.last_native_frame
+            {
+                rect.origin.x += f.origin.x;
+                rect.origin.y += f.origin.y;
+            }
+            anc = a.parent;
+        }
+    }
+
+    /// Queue an [`Event::ScrollChanged`] for a SCROLL node with the toolkit's live offset —
+    /// what day-core reports after a programmatic scroll and when layout changes the
+    /// viewport or content, so `on_scroll` hears every cause (docs/scroll.md). A toolkit
+    /// that also reports the same move from its own notification sends a duplicate the
+    /// handlers de-duplicate by value; queue-only either way (§8.3).
+    pub(crate) fn report_scroll(&mut self, node: RNode) {
+        let Some(h) = self.nodes.get(node).and_then(|n| n.handle.clone()) else {
+            return;
+        };
+        let offset = self.toolkit.scroll_offset(&h);
+        let id = rnode_to_id(node);
+        // One report per drain per scroll: a layout pass that resizes the viewport AND the
+        // content would otherwise queue two, and a listener only wants the latest offset.
+        let replaced = EVENTS.with(|e| {
+            let mut q = e.borrow_mut();
+            match q
+                .iter_mut()
+                .find(|(n, ev)| *n == id && matches!(ev, Event::ScrollChanged(_)))
+            {
+                Some((_, ev)) => {
+                    *ev = Event::ScrollChanged(offset);
+                    true
+                }
+                None => false,
+            }
+        });
+        if !replaced {
+            enqueue_event(id, Event::ScrollChanged(offset));
+        }
     }
 
     /// The animation intent for a change to `node` (§8.4): the ambient `with_animation` if one is
@@ -594,6 +656,37 @@ pub enum ScrollTarget {
     Id(String),
 }
 
+/// Where a scroll view is (§7.6, docs/scroll.md § Reading the position): the viewport origin
+/// in content space, the viewport's size and the content's. `visible_rect` is the part of the
+/// content on screen, in the same space `TreeOps::frame_in_scroll` reports a child's frame in,
+/// so "is this card visible" is one intersection.
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
+pub struct ScrollState {
+    pub offset: Point,
+    pub viewport: Size,
+    pub content: Size,
+}
+
+impl ScrollState {
+    /// The content rectangle currently inside the viewport.
+    pub fn visible_rect(&self) -> Rect {
+        Rect::new(
+            self.offset.x,
+            self.offset.y,
+            self.viewport.width,
+            self.viewport.height,
+        )
+    }
+
+    /// The farthest the viewport origin can go (content minus viewport, never negative).
+    pub fn max_offset(&self) -> Point {
+        Point::new(
+            (self.content.width - self.viewport.width).max(0.0),
+            (self.content.height - self.viewport.height).max(0.0),
+        )
+    }
+}
+
 pub trait TreeOps {
     // The object-safe seam mirrors NodeData's fields one-to-one; grouping them into a
     // params struct would just move the same list behind a constructor.
@@ -661,6 +754,18 @@ pub trait TreeOps {
     /// Scroll the nearest enclosing SCROLL ancestor so `node`'s frame is visible (minimal
     /// scroll, `scrollRectToVisible` semantics). False when no scroll ancestor exists.
     fn scroll_reveal(&mut self, node: RNode, animated: bool) -> bool;
+    /// The live position of a SCROLL node (docs/scroll.md § Reading the position): the
+    /// toolkit's offset, the node's laid-out frame as the viewport, and the content size
+    /// `ScrollLayout` last reported. `None` for anything but a realized scroll.
+    fn scroll_state(&mut self, node: RNode) -> Option<ScrollState>;
+    /// Ask for [`Event::FrameChanged`] on `node` whenever its frame within its nearest
+    /// enclosing scroll (or the window, when there is none) moves or resizes — the
+    /// `on_frame` decorator's switch. Reported from layout, queue-only, like a canvas's.
+    fn report_frames(&mut self, node: RNode);
+    /// `node`'s frame in the content space of its nearest enclosing SCROLL (the space
+    /// [`ScrollState::visible_rect`] is in), or in the window when no scroll encloses it.
+    /// `None` until the node has been laid out.
+    fn frame_in_scroll(&self, node: RNode) -> Option<Rect>;
     fn patch(&mut self, node: RNode, patch: Box<dyn Any>, affects_size: bool);
     fn replay(&mut self, node: RNode, ops: Vec<DrawOp>);
     /// Set (or clear) a node's implicit `.animation` (§8.4): subsequent property patches and frame
@@ -984,6 +1089,7 @@ impl<B: Toolkit> TreeOps for Tree<B> {
             needs_measure: true,
             last_native_frame: None,
             scroll_content: None,
+            frame_report: None,
             implicit_anim: None,
             tweaked: false,
             is_boundary,
@@ -1256,39 +1362,51 @@ impl<B: Toolkit> TreeOps for Tree<B> {
             ScrollTarget::Id(_) => unreachable!("routed to scroll_reveal above"),
         };
         self.toolkit.scroll_to(&h, rect, animated);
+        self.report_scroll(node);
         true
     }
 
     fn scroll_reveal(&mut self, node: RNode, animated: bool) -> bool {
         // The element's frame is relative to its nearest REALIZED native ancestor (§7);
-        // accumulate native origins up to (not including) the enclosing scroll, which puts
-        // the rect in the scroll's content space — what Toolkit::scroll_to expects.
-        let Some(mut rect) = self.nodes.get(node).and_then(|n| n.last_native_frame) else {
+        // accumulated up to (not including) the enclosing scroll, it is in the scroll's
+        // content space — what Toolkit::scroll_to expects.
+        let Some((Some(scroll), rect)) = self.content_frame(node) else {
+            return false; // never laid out, or no scroll ancestor
+        };
+        let Some(h) = self.nodes.get(scroll).and_then(|n| n.handle.clone()) else {
             return false;
         };
-        let mut anc = match self.nodes.get(node) {
-            Some(n) => n.parent,
-            None => return false,
-        };
-        loop {
-            let Some(a) = self.nodes.get(anc) else {
-                return false; // walked off the root: no scroll ancestor
-            };
-            if a.kind == kinds::SCROLL {
-                let Some(h) = a.handle.clone() else {
-                    return false;
-                };
-                self.toolkit.scroll_to(&h, rect, animated);
-                return true;
-            }
-            if a.handle.is_some()
-                && let Some(f) = a.last_native_frame
-            {
-                rect.origin.x += f.origin.x;
-                rect.origin.y += f.origin.y;
-            }
-            anc = a.parent;
+        self.toolkit.scroll_to(&h, rect, animated);
+        self.report_scroll(scroll);
+        true
+    }
+
+    fn scroll_state(&mut self, node: RNode) -> Option<ScrollState> {
+        let n = self.nodes.get(node)?;
+        if n.kind != kinds::SCROLL {
+            return None;
         }
+        let h = n.handle.clone()?;
+        let viewport = n.last_native_frame.map(|f| f.size).unwrap_or(Size::ZERO);
+        let content = n.scroll_content.unwrap_or(viewport);
+        let offset = self.toolkit.scroll_offset(&h);
+        Some(ScrollState {
+            offset,
+            viewport,
+            content,
+        })
+    }
+
+    fn report_frames(&mut self, node: RNode) {
+        if let Some(n) = self.nodes.get_mut(node)
+            && n.frame_report.is_none()
+        {
+            n.frame_report = Some(None);
+        }
+    }
+
+    fn frame_in_scroll(&self, node: RNode) -> Option<Rect> {
+        self.content_frame(node).map(|(_, rect)| rect)
     }
 
     fn patch(&mut self, node: RNode, patch: Box<dyn Any>, affects_size: bool) {
@@ -1604,6 +1722,7 @@ impl<B: Toolkit> TreeOps for Tree<B> {
             needs_measure: true,
             last_native_frame: None,
             scroll_content: None,
+            frame_report: None,
             implicit_anim: None,
             tweaked: false,
             is_boundary: true,

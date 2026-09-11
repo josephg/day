@@ -734,9 +734,17 @@ pub enum Event {
         phase: DragPhase,
         location: Point,
     },
+    /// A scroll view's viewport origin moved (§7.6, docs/scroll.md § Reading the position):
+    /// the offset in content space, as [`Toolkit::scroll_offset`] would answer it. Emitted by
+    /// the toolkit as the user scrolls a `scroll` piece or a `list`'s row rail (at most once
+    /// per frame — a backend coalesces its per-pixel notifications), and by day-core after a
+    /// programmatic scroll or when the scroll's viewport or content size changes in layout,
+    /// so a handler can recompute what is in view on every cause with one event.
     ScrollChanged(Point),
     /// A canvas node was re-framed by layout; re-record (§11). Nav pane/page containers
-    /// also report their allocated size with this (docs/navigation.md).
+    /// also report their allocated size with this (docs/navigation.md). Also delivered to any
+    /// node that asked for frame reports (`TreeOps::report_frames`, the `on_frame` decorator)
+    /// whenever its frame within its nearest enclosing scroll moves or resizes.
     FrameChanged(Size),
     /// Native back navigation (iOS back button/swipe, Android system back or toolbar up).
     /// `already_popped` = the toolkit already performed the pop natively (iOS); the nav
@@ -2139,6 +2147,14 @@ pub enum Cap {
     /// [`TextMetrics::approximate`]. Probe this before offering a font menu, not before
     /// drawing — a [`CanvasFont`] draws everywhere.
     FontList,
+    /// The toolkit reports where its scroll views are: a `scroll` piece (and a `list`'s own
+    /// row rail) emits [`Event::ScrollChanged`] as the user scrolls, coalesced to at most one
+    /// report per frame, and answers [`Toolkit::scroll_offset`] with the live position
+    /// (docs/scroll.md § Reading the position). Programmatic scrolls and layout changes are
+    /// reported by day-core on every backend regardless; this says whether the USER's
+    /// scrolling reaches the app too. `Unsupported` ⇒ `scroll(..).on_scroll(..)` hears only
+    /// the programmatic and layout-driven reports.
+    ScrollReports,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]

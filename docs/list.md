@@ -92,8 +92,9 @@ follow.notify();
   `ListView::smoothScrollToPosition` · XAML `ScrollViewer::ChangeView`). day-core guards the
   empty-list case (no patch is sent), and building the list never auto-scrolls.
 - `.stick_to_bottom(bool)`: best-effort convenience that scrolls to the end after each data reload.
-  It does not check whether the user is already near the bottom (no cross-backend scroll-position
-  read exists yet); for that finer behavior drive `scroll_to_end` from your own logic instead.
+  It does not check whether the user is already near the bottom; for that finer behavior
+  drive `scroll_to_end` from your own logic, reading the position through `.on_scroll(..)`
+  (§ Reading the position) where the toolkit reports it.
 
 ## `ListSource`: how the backend pulls rows
 
@@ -213,6 +214,20 @@ realizing it if it was virtualized away (`ListPatch::ScrollToRow`, clamped to th
 signal is the row rail's counterpart to `scroll(...).scroll_target(...)`. Backends without a native
 scroll-to-index (GTK ≤ 4.10, Qt, XAML, web) position by uniform row pitch; prefer
 `RowHeight::Uniform` when jumping programmatically there.
+
+### Reading the position
+
+`list(..).on_scroll(|st: ScrollState| ..)` is the row rail's counterpart to
+`scroll(..).on_scroll(..)` ([docs/scroll.md](scroll.md) § Reading the position): `st.offset`
+and `st.viewport` are the native list's own scroller's, and `st.content` is the rows' extent
+— `rows × pitch` under `RowHeight::Uniform`, the viewport itself under `Automatic` (the host
+owns that extent and does not tell Day). With a uniform pitch the rows on screen are
+`offset.y / pitch ..= (offset.y + viewport.height) / pitch`, which is what a list that
+prefetches for what it shows needs (Fastmail's `MessageDetailsPreloader` works on exactly
+that range). Reported by the toolkits that answer `Cap::ScrollReports` — GTK, from the
+`GtkScrolledWindow` around the `GtkListView` (its `value-changed`, `page-size` and `upper`
+notifications, one report per frame) — at an event drain; `stick_to_bottom`'s "is the user
+already near the bottom" refinement can now be built on it.
 
 A Reload whose rows are the same set in a new order (a shuffle, a programmatic sort) animates
 as native row moves on AppKit (`moveRowAtIndex` batch, the same animation a drag commit gets);
