@@ -4001,24 +4001,29 @@ fn scroll_target_signal_drives_offset() {
 fn scroll_state_follows_programmatic_scrolls_and_layout() {
     // The read side of `scroll_target` (docs/scroll.md § Reading the position): every
     // programmatic scroll is reported by day-core as `ScrollChanged`, so the bound signal
-    // follows without the toolkit's help; the first layout reports too (content size).
+    // follows without the toolkit's help; the first layout reports too. The scroll sits
+    // UNDER a header, so that first layout both frames it (`place_node`) and sizes its
+    // content (`set_scroll_content`) — two causes in one pass, coalesced to one report.
     let jump: Signal<Option<ScrollTarget>> = Signal::new(None);
     let state: Signal<ScrollState> = Signal::new(ScrollState::default());
     let heard = Rc::new(RefCell::new(Vec::<Point>::new()));
     let (jump2, heard2) = (jump, heard.clone());
     let probe = boot(move || {
-        scroll(column(PieceVec(
-            (0..100)
-                .map(|i| label(format!("row {i}")).id(format!("st-row-{i}")).any())
-                .collect(),
-        )))
-        .scroll_target(jump2)
-        .scroll_state(state)
-        .on_scroll(move |st| heard2.borrow_mut().push(st.offset))
-        .any()
+        column((
+            label("header").id("st-header"),
+            scroll(column(PieceVec(
+                (0..100)
+                    .map(|i| label(format!("row {i}")).id(format!("st-row-{i}")).any())
+                    .collect(),
+            )))
+            .scroll_target(jump2)
+            .scroll_state(state)
+            .on_scroll(move |st| heard2.borrow_mut().push(st.offset)),
+        ))
     });
     day_core::pump_events();
     let w = probe.find_by_kind("day.scroll")[0].1.clone();
+    assert!(w.frame.origin.y > 0.0, "the scroll sits under the header");
     let st = state.get_untracked();
     assert_eq!(
         st.viewport, w.frame.size,
@@ -4029,7 +4034,11 @@ fn scroll_state_follows_programmatic_scrolls_and_layout() {
         "content is the size ScrollLayout reported"
     );
     assert_eq!(st.offset, Point::ZERO);
-    assert_eq!(heard.borrow().len(), 1, "one report for the first layout");
+    assert_eq!(
+        heard.borrow().len(),
+        1,
+        "one report for the first layout, though it framed the scroll and sized its content"
+    );
 
     jump.set(Some(ScrollTarget::Offset(Point::new(0.0, 123.0))));
     flush_sync();
@@ -4045,10 +4054,58 @@ fn scroll_state_follows_programmatic_scrolls_and_layout() {
     );
     assert_eq!(heard.borrow().last().copied(), Some(Point::new(0.0, 123.0)));
 
-    // A toolkit's own report (the user scrolling) rides the same handler.
+    // A toolkit's own report (the user scrolling) rides the same handler; its echo of a
+    // state the handler already delivered is absorbed (one callback per distinct state).
     let node = node_id(&probe, "day.scroll", 0);
     probe.emit(node, Event::ScrollChanged(Point::new(0.0, 40.0)));
     assert_eq!(state.get_untracked().offset.y, 40.0);
+    let n = heard.borrow().len();
+    probe.emit(node, Event::ScrollChanged(Point::new(0.0, 40.0)));
+    assert_eq!(
+        heard.borrow().len(),
+        n,
+        "a repeated state is not delivered twice"
+    );
+}
+
+#[test]
+fn scroll_reports_a_root_scrolls_resize_once_and_the_observer_sees_it() {
+    // A scroll at the window's root is never re-framed by `set_frame` (the toolkit sizes
+    // the root), yet a window resize changes its viewport: reported all the same, once per
+    // pass, and the §14.6 event observer sees the report the app receives — not a stale
+    // one rewritten in place behind its back.
+    let heard = Rc::new(RefCell::new(Vec::<ScrollState>::new()));
+    let heard2 = heard.clone();
+    let probe = boot(move || {
+        scroll(column(PieceVec(
+            (0..100).map(|i| label(format!("row {i}")).any()).collect(),
+        )))
+        .on_scroll(move |st| heard2.borrow_mut().push(st))
+    });
+    day_core::pump_events();
+    assert_eq!(heard.borrow().len(), 1, "the first layout reports once");
+    let observed = Rc::new(RefCell::new(Vec::<Point>::new()));
+    let observed2 = observed.clone();
+    day_core::set_event_observer(Some(Box::new(move |_, ev| {
+        if let Event::ScrollChanged(p) = ev {
+            observed2.borrow_mut().push(*p);
+        }
+    })));
+    probe.emit(
+        day_spec::WINDOW_NODE,
+        Event::WindowResized(Size::new(300.0, 250.0)),
+    );
+    day_core::pump_events();
+    let last = *heard.borrow().last().unwrap();
+    assert_eq!(
+        heard.borrow().len(),
+        2,
+        "a resize is one report: {:?}",
+        heard.borrow()
+    );
+    assert_eq!(last.viewport, Size::new(300.0, 250.0));
+    assert_eq!(observed.borrow().last().copied(), Some(last.offset));
+    day_core::set_event_observer(None);
 }
 
 #[test]
@@ -4103,6 +4160,94 @@ fn on_frame_reports_a_child_in_its_scrolls_content_space() {
 }
 
 #[test]
+fn on_frame_accumulates_through_an_ancestor_at_a_non_zero_origin() {
+    // The report is in the scroll's content space, not the native parent's: a card inside a
+    // padded row after a leading spacer sits at the row's origin plus its own.
+    let frame: Signal<Option<Rect>> = Signal::new(None);
+    let probe = boot(move || {
+        scroll(column((
+            column(()).height(80.0),
+            row((
+                column(()).width(30.0),
+                label("card")
+                    .on_frame(move |r| frame.set(Some(r)))
+                    .id("offset-card"),
+            ))
+            .padding(12.0)
+            .id("offset-row"),
+        )))
+    });
+    day_core::pump_events();
+    let reported = frame
+        .get_untracked()
+        .expect("reported after the first layout");
+    let native = with_tree_frame(&probe, "offset-card");
+    assert!(
+        native.origin.x >= 30.0,
+        "the native frame is relative to the row, past the spacer: {native:?}"
+    );
+    assert!(
+        reported.origin.y >= 80.0 + 12.0 && reported.origin.x >= 30.0 + 12.0,
+        "under the spacer and inside the padding, in content space: {reported:?}"
+    );
+    assert_ne!(
+        reported.origin, native.origin,
+        "the content-space frame is not the native one"
+    );
+    assert_eq!(reported.size, native.size);
+    // The same walk `scroll_reveal` takes: the accumulated frame is what a reveal targets.
+    let node = day_core::with_tree(|t| t.find_by_id("offset-card")).unwrap();
+    assert_eq!(
+        day_core::with_tree(|t| t.frame_in_scroll(node)),
+        Some(reported)
+    );
+}
+
+#[test]
+fn on_frame_inside_a_nested_scroll_reports_in_the_inner_space() {
+    // Nested scrolls: the walk stops at the NEAREST enclosing scroll, so a card in the inner
+    // one reports in the inner content space, unmoved by the outer header or the outer
+    // scroll's own position.
+    let frame: Signal<Option<Rect>> = Signal::new(None);
+    let outer: Signal<Option<ScrollTarget>> = Signal::new(None);
+    let outer2 = outer;
+    let probe = boot(move || {
+        scroll(column((
+            column(()).height(50.0),
+            scroll(column((
+                column(()).height(100.0),
+                label("inner card")
+                    .on_frame(move |r| frame.set(Some(r)))
+                    .id("inner-card"),
+            )))
+            .horizontal()
+            .id("inner-scroll")
+            .height(200.0),
+            column(()).height(900.0),
+        )))
+        .scroll_target(outer2)
+        .id("outer-scroll")
+    });
+    day_core::pump_events();
+    let first = frame
+        .get_untracked()
+        .expect("reported after the first layout");
+    assert_eq!(
+        first.origin.y, 100.0,
+        "under the inner spacer only, not the outer header: {first:?}"
+    );
+    let inner = day_core::with_tree(|t| t.find_by_id("inner-scroll")).unwrap();
+    let inner_st = day_core::with_tree(|t| t.scroll_state(inner)).unwrap();
+    assert!(inner_st.visible_rect().intersects(&first));
+    // Driving the OUTER scroll moves nothing in the inner space: no new report.
+    outer.set(Some(ScrollTarget::Offset(Point::new(0.0, 120.0))));
+    flush_sync();
+    day_core::pump_events();
+    assert_eq!(frame.get_untracked(), Some(first));
+    let _ = probe;
+}
+
+#[test]
 fn list_on_scroll_reports_the_row_rail() {
     // The list's report: the toolkit's offset, the node's frame as the viewport, and the
     // rows' extent under a uniform pitch (docs/list.md § Reading the position).
@@ -4123,6 +4268,51 @@ fn list_on_scroll_reports_the_row_rail() {
     assert_eq!(st.content.height, 50.0 * 40.0, "rows × pitch");
     assert_eq!(st.viewport, probe.find_by_kind("day.list")[0].1.frame.size);
     assert_eq!((st.offset.y / 40.0) as usize, 2, "first visible row");
+    // The same state again is one callback, not two.
+    seen.set(None);
+    probe.emit(host, Event::ScrollChanged(Point::new(0.0, 80.0)));
+    assert_eq!(seen.get_untracked(), None, "a repeated state is absorbed");
+}
+
+#[test]
+fn on_frame_inside_a_list_cell_is_relative_to_the_cell() {
+    // A list cell is the boundary (docs/list.md § Reading the position): the rail scrolls it
+    // natively, so a frame inside reports relative to the cell, not accumulated through the
+    // list's own frame in the window.
+    let seen: Rc<RefCell<Vec<Rect>>> = Rc::new(RefCell::new(Vec::new()));
+    let seen2 = seen.clone();
+    let probe = boot(move || {
+        column((
+            column(()).height(120.0),
+            list(
+                items(|| (0..5).collect::<Vec<u32>>(), |i| *i as u64),
+                move |slot: ItemSlot<u32, u64>| {
+                    let seen = seen2.clone();
+                    row((
+                        column(()).width(24.0),
+                        label(move || slot.get().to_string())
+                            .on_frame(move |r| seen.borrow_mut().push(r)),
+                    ))
+                },
+            )
+            .row_height(RowHeight::Uniform(40.0)),
+        ))
+    });
+    let host = probe.find_by_kind("day.list")[0].0;
+    let list_frame = probe.find_by_kind("day.list")[0].1.frame;
+    assert_eq!(list_frame.origin.y, 120.0, "the list sits under the spacer");
+    // The native list pulls two cells (virtualization): each row is laid out in its cell.
+    probe.list_bind(host, 0, MockHandle(9101));
+    probe.list_bind(host, 1, MockHandle(9102));
+    day_core::pump_events();
+    let frames = seen.borrow();
+    assert_eq!(frames.len(), 2, "each bound row reported: {frames:?}");
+    for r in frames.iter() {
+        assert!(
+            r.origin.y < 120.0 && (r.origin.x - 24.0).abs() < 0.5,
+            "relative to the cell, past the leading spacer only: {r:?}"
+        );
+    }
 }
 
 #[test]

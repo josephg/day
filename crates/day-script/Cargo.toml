@@ -22,3 +22,8 @@ serde_json = "1"
 # includes the CLI; on the app side it replaces no smaller alternative (hand-emitting YAML would
 # have to re-implement quoting/escaping).
 serde_norway = "0.9"
+
+[dev-dependencies]
+# The step tests boot a real tree on the mock toolkit and drive it through `exec`.
+day-mock = { workspace = true }
+day-pieces = { workspace = true }

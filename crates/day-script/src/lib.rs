@@ -2054,6 +2054,59 @@ mod tests {
         unsafe { std::env::remove_var("DAY_SCRIPT_MAIN_TIMEOUT_SECS") };
     }
 
+    /// `scroll_to: { id, dx, dy }` moves from where the scroll IS (docs/scroll.md §dayscript):
+    /// two steps add up, a step past an edge clamps like any offset, and the id must name a
+    /// scroll piece — an element inside one is a reveal, not a relative move.
+    #[test]
+    fn scroll_to_dx_dy_moves_relative_to_the_current_offset() {
+        use day_pieces::prelude::*;
+        day_core::uninstall_tree();
+        let (mock, probe) = day_mock::MockToolkit::new();
+        day_core::launch_with(
+            mock,
+            day_spec::WindowOptions {
+                title: "test".into(),
+                size: day_spec::Size::new(400.0, 600.0),
+                ..Default::default()
+            },
+            || {
+                scroll(column(PieceVec(
+                    (0..100)
+                        .map(|i| label(format!("row {i}")).id(format!("row-{i}")).any())
+                        .collect(),
+                )))
+                .id("page")
+                .any()
+            },
+        );
+        let offset = || probe.find_by_kind("day.scroll")[0].1.scroll_offset;
+        let step = |id: &str, dx: Option<f64>, dy: Option<f64>| {
+            exec(Step::ScrollTo {
+                id: id.into(),
+                edge: None,
+                x: None,
+                y: None,
+                dx,
+                dy,
+            })
+        };
+        assert!(step("page", None, Some(200.0)).ok);
+        assert_eq!(offset().y, 200.0);
+        assert!(
+            step("page", None, Some(150.0)).ok,
+            "relative to the new position"
+        );
+        assert_eq!(offset().y, 350.0);
+        assert!(
+            step("page", Some(0.0), Some(-1000.0)).ok,
+            "clamped at the top"
+        );
+        assert_eq!(offset(), day_spec::Point::ZERO);
+        let reply = step("row-3", None, Some(10.0));
+        assert!(!reply.ok, "a relative move needs a scroll piece: {reply:?}");
+        day_core::uninstall_tree();
+    }
+
     /// `menu: { id: … }` is the address that survives a label change — which is exactly what a
     /// checked item does to itself on every state flip — and it never falls back to the label,
     /// so a step naming an id that is not there fails instead of hitting a lookalike.
