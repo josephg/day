@@ -234,6 +234,11 @@ mod imp {
         /// LIST table ptr → (table, data source).
         static LIST_STATE: RefCell<HashMap<usize, ListEntry>> = RefCell::new(HashMap::new());
 
+        /// SCROLL view ptr → its position reporter (docs/scroll.md § Reading the position);
+        /// a `UIScrollView` keeps its delegate weakly, so this is what keeps it alive.
+        static SCROLL_REPORTERS: RefCell<HashMap<usize, Retained<DayScrollReporter>>> =
+            RefCell::new(HashMap::new());
+
         /// TREE collection-view ptr → its delegate/state object (docs/tree.md).
         static TREE_STATE: RefCell<HashMap<usize, Retained<DayTreeData>>> =
             RefCell::new(HashMap::new());
@@ -5489,6 +5494,82 @@ mod imp {
     }
 
     // -----------------------------------------------------------------------
+    // Scroll reports (docs/scroll.md § Reading the position): a scroll view's position as
+    // Event::ScrollChanged while the USER scrolls — a drag, a fling's every frame, a pull —
+    // coalesced to one report per main-queue turn. day-core reports programmatic scrolls and
+    // layout changes itself, so those never come through here.
+    // -----------------------------------------------------------------------
+
+    /// The viewport origin in CONTENT space — what `Toolkit::scroll_offset` answers and
+    /// `ScrollChanged` carries. `contentOffset` is measured from the adjusted inset's origin
+    /// (a list running under a translucent navigation bar rests at a NEGATIVE offset), and
+    /// day-core's content space starts at zero, the way GTK's adjustments do.
+    fn scroll_content_offset(sv: &UIScrollView) -> day_spec::Point {
+        let o = unsafe { sv.contentOffset() };
+        let inset = unsafe { sv.adjustedContentInset() };
+        day_spec::Point::new(o.x + inset.left, o.y + inset.top)
+    }
+
+    /// Arm one report for `sv`: `scrollViewDidScroll:` fires per frame of a drag and per
+    /// frame of a deceleration, and several times within one turn when insets settle, so the
+    /// first call in a turn queues the emit and later ones are absorbed; the emit reads the
+    /// CURRENT offset once. Enqueue-only through `emit` (§8.3).
+    fn arm_scroll_report(node: NodeId, sv: &UIScrollView, pending: &Rc<std::cell::Cell<bool>>) {
+        if pending.replace(true) {
+            return;
+        }
+        let Some(mtm) = MainThreadMarker::new() else {
+            pending.set(false);
+            return;
+        };
+        let bound = dispatch2::MainThreadBound::new((sv.retain(), pending.clone()), mtm);
+        dispatch2::DispatchQueue::main().exec_async(move || {
+            let mtm = MainThreadMarker::new().expect("main queue");
+            let (sv, pending) = bound.into_inner(mtm);
+            pending.set(false);
+            let offset = scroll_content_offset(&sv);
+            if *DIAG_NAV {
+                log::debug!("DAYDIAG scroll report node={node:?} offset=({:.0}, {:.0})", offset.x, offset.y);
+            }
+            emit(node, Event::ScrollChanged(offset));
+        });
+    }
+
+    struct ScrollReporterIvars {
+        node: NodeId,
+        pending: Rc<std::cell::Cell<bool>>,
+    }
+
+    define_class!(
+        #[unsafe(super(NSObject))]
+        #[thread_kind = MainThreadOnly]
+        #[name = "DayScrollReporter"]
+        #[ivars = ScrollReporterIvars]
+        struct DayScrollReporter;
+
+        unsafe impl NSObjectProtocol for DayScrollReporter {}
+
+        unsafe impl UIScrollViewDelegate for DayScrollReporter {
+            #[unsafe(method(scrollViewDidScroll:))]
+            fn did_scroll(&self, sv: &UIScrollView) {
+                day_spec::ffi_guard::contain((), || {
+                    arm_scroll_report(self.ivars().node, sv, &self.ivars().pending);
+                });
+            }
+        }
+    );
+
+    impl DayScrollReporter {
+        fn new(mtm: MainThreadMarker, node: NodeId) -> Retained<Self> {
+            let this = Self::alloc(mtm).set_ivars(ScrollReporterIvars {
+                node,
+                pending: Rc::new(std::cell::Cell::new(false)),
+            });
+            unsafe { msg_send![super(this), init] }
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // DayListData — UITableView data source + delegate for the recycling list (docs/list.md, §10)
     // -----------------------------------------------------------------------
 
@@ -5499,6 +5580,8 @@ mod imp {
         selectable: std::cell::Cell<bool>,
         /// The app's localized word for the swipe action (docs/list.md); empty ⇒ trash glyph.
         delete_label: RefCell<String>,
+        /// One `ScrollChanged` per turn for the row rail (`arm_scroll_report`).
+        scroll_pending: Rc<std::cell::Cell<bool>>,
     }
 
     define_class!(
@@ -5509,7 +5592,17 @@ mod imp {
         struct DayListData;
 
         unsafe impl NSObjectProtocol for DayListData {}
-        unsafe impl UIScrollViewDelegate for DayListData {}
+
+        // The table IS a scroll view; its delegate hears the row rail move (docs/list.md
+        // § Reading the position), through the same coalescing as a `scroll` piece's.
+        unsafe impl UIScrollViewDelegate for DayListData {
+            #[unsafe(method(scrollViewDidScroll:))]
+            fn did_scroll(&self, sv: &UIScrollView) {
+                day_spec::ffi_guard::contain((), || {
+                    arm_scroll_report(self.ivars().node, sv, &self.ivars().scroll_pending);
+                });
+            }
+        }
 
         unsafe impl UITableViewDataSource for DayListData {
             #[unsafe(method(tableView:numberOfRowsInSection:))]
@@ -5854,6 +5947,7 @@ mod imp {
                 row_height: std::cell::Cell::new(row_height),
                 selectable: std::cell::Cell::new(selectable),
                 delete_label: RefCell::new(delete_label),
+                scroll_pending: Rc::new(std::cell::Cell::new(false)),
             });
             unsafe { msg_send![super(this), init] }
         }
@@ -7286,6 +7380,9 @@ mod imp {
                 // The same pipeline generalized: app-declared actions on either edge, with
                 // the full-swipe shortcut on the first (docs/list.md).
                 | Cap::ListSwipeActions
+                // `scrollViewDidScroll:` on every scroll view and list, one report per turn
+                // (`arm_scroll_report`, docs/scroll.md § Reading the position).
+                | Cap::ScrollReports
                 // A `UISplitViewController` hosts every `nav(Sidebar)`, so two columns are
                 // available wherever the window is wide enough — an iPad, and a Plus/Pro Max
                 // iPhone in landscape (docs/size-classes.md).
@@ -7883,7 +7980,12 @@ mod imp {
                 }
                 Some(Builtin::Scroll) => {
                     let sv = unsafe { UIScrollView::new(mtm) };
-                    view_of(sv)
+                    // Position reports as the user scrolls (docs/scroll.md).
+                    let reporter = DayScrollReporter::new(mtm, id);
+                    unsafe { sv.setDelegate(Some(ProtocolObject::from_ref(&*reporter))) };
+                    let view = view_of(sv);
+                    SCROLL_REPORTERS.with(|m| m.borrow_mut().insert(ptr_of(&view), reporter));
+                    view
                 }
                 Some(Builtin::Label) => {
                     let Some(p) = day_spec::props_of::<LabelProps>(kind, "uikit", props) else {
@@ -8785,6 +8887,9 @@ mod imp {
             LIST_STATE.with(|m| {
                 m.borrow_mut().remove(&ptr_of(&h));
             });
+            SCROLL_REPORTERS.with(|m| {
+                m.borrow_mut().remove(&ptr_of(&h));
+            });
             TREE_STATE.with(|m| {
                 m.borrow_mut().remove(&ptr_of(&h));
             });
@@ -9282,6 +9387,15 @@ mod imp {
                         animated,
                     )
                 };
+            }
+        }
+
+        fn scroll_offset(&mut self, h: &Handle) -> day_spec::Point {
+            // A `scroll` piece's view and a `list`'s table are both scroll views; the viewport
+            // origin in content space (docs/scroll.md § Reading the position).
+            match (**h).downcast_ref::<UIScrollView>() {
+                Some(sv) => scroll_content_offset(sv),
+                None => day_spec::Point::ZERO,
             }
         }
 

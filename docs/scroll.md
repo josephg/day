@@ -54,9 +54,9 @@ buttons drive the recycling list's row rail (`.scroll_to_row`/`.scroll_to_end`, 
 
 ## Reading the position
 
-> **Status: implemented** on GTK, web-dom and mock (`Cap::ScrollReports` is `Native` there;
-> the other backends answer `Unsupported` and `on_scroll` never runs there — not even for the
-> programmatic and layout-driven reports below, which read the position through
+> **Status: implemented** on GTK, UIKit, web-dom and mock (`Cap::ScrollReports` is `Native`
+> there; the other backends answer `Unsupported` and `on_scroll` never runs there — not even
+> for the programmatic and layout-driven reports below, which read the position through
 > `Toolkit::scroll_offset` and would be zero without it). Verified by
 > `crates/day-pieces/tests/mock_e2e.rs` (`scroll_state_follows_programmatic_scrolls_and_layout`,
 > `scroll_reports_a_root_scrolls_resize_once_…`, `on_frame_reports_a_child_…`,
@@ -118,11 +118,17 @@ enqueued through the normal path, never rewritten in place.
 `Toolkit::scroll_offset(handle)` is the duty behind both — day-core reads it for the
 synthesized reports, and makes them only where `Cap::ScrollReports` is answered: an arm that
 has the duty but not the cap (XAML today, docs/duty-matrix.md) gets none until it emits the
-user's scrolls too, rather than reports that are right by luck. The
-Apple, Android, Qt and ArkUI arms are not written: `NSScrollView`'s
-`NSViewBoundsDidChangeNotification` on the clip view, `UIScrollViewDelegate.scrollViewDidScroll`,
-`View.OnScrollChangeListener`, `QScrollBar::valueChanged` and `NODE_SCROLL_EVENT_ON_SCROLL`
-are the hooks, each wanting the same per-frame coalescing.
+user's scrolls too, rather than reports that are right by luck.
+UIKit (2026-09): every `scroll` piece's `UIScrollView` gets a delegate and the `list`'s
+table delegate hears the same call — `scrollViewDidScroll:` fires per frame of a drag, of a
+fling's deceleration and of a pull, and the arm coalesces to one report per main-queue turn,
+emitting the offset it reads THEN. The offset is the viewport origin in content space:
+`contentOffset` plus `adjustedContentInset` (a list under a translucent bar rests at a
+negative `contentOffset`), which is what `Toolkit::scroll_offset` answers there too. The
+AppKit, Android, Qt and ArkUI arms are not written: `NSScrollView`'s
+`NSViewBoundsDidChangeNotification` on the clip view, `View.OnScrollChangeListener`,
+`QScrollBar::valueChanged` and `NODE_SCROLL_EVENT_ON_SCROLL` are the hooks, each wanting the
+same per-frame coalescing.
 
 A `list` has the same channel for its own row rail — `list(..).on_scroll(..)` — see
 [docs/list.md](list.md) § Reading the position.
