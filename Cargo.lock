@@ -1259,6 +1259,7 @@ dependencies = [
  "day-uikit",
  "day-xaml",
  "day-xaml-sys",
+ "dispatch2",
  "gtk4",
  "linkme",
  "log",

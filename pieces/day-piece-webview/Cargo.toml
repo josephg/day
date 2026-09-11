@@ -25,7 +25,7 @@ appkit = ["dep:day-appkit", "dep:objc2", "dep:objc2-app-kit", "dep:objc2-foundat
 gtk = ["dep:day-gtk", "dep:gtk4", "dep:webkit6"]
 qt = ["dep:day-qt"]                 # + build.rs compiles src/lib-qt-shim.cpp, linking Qt6WebEngineWidgets when present (else a URL-label fallback)
 # objc2-web-kit 0.3 binds WKWebView for macOS only, so UIKit hand-rolls it via extern_class!/msg_send!.
-uikit = ["dep:day-uikit", "dep:objc2", "dep:objc2-ui-kit", "dep:objc2-foundation", "dep:objc2-core-foundation", "dep:block2"]
+uikit = ["dep:day-uikit", "dep:objc2", "dep:objc2-ui-kit", "dep:objc2-foundation", "dep:objc2-core-foundation", "dep:block2", "dep:dispatch2"]
 mdc = ["dep:day-android"]        # + [package.metadata.day.android]
 xaml = ["dep:day-xaml", "dep:day-xaml-sys"]     # + build.rs compiles src/lib-xaml-shim.cpp
 # The ArkUI C node API has no Web node, so this backend is the crate's ArkTS half
@@ -60,6 +60,8 @@ day-arkui = { workspace = true, optional = true }
 day-dom = { workspace = true, optional = true }
 # Apple completion handlers for evaluateJavaScript: (docs/webview-eval.md).
 block2 = { version = "0.6", optional = true }
+# The UIKit arm's diagnostic zoom (`DAY_DIAG_WEB_ZOOM`) is driven a moment after the first report.
+dispatch2 = { version = "0.3", optional = true }
 gtk4 = { version = "0.11", optional = true }
 objc2 = { version = "0.6", optional = true }
 objc2-app-kit = { version = "0.3", optional = true, features = ["NSView", "NSResponder"] }

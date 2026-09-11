@@ -83,9 +83,12 @@ const FIT_WORLD: &str = "day-fit";
 /// when the content is wider than the layout viewport it rewrites the viewport meta to lay
 /// the page out at its natural width, zoomed out to fit the leaf — WebKit's own scaling, so
 /// the text stays crisp and a pinch zooms back in (to three times natural) — and reports the
-/// height MULTIPLIED by the visual viewport's scale, so the leaf is as tall as the scaled
-/// page, whether zoomed out to fit or pinched in. A second field says whether the user is
-/// zoomed in past the fit scale: while they are, the view pans sideways itself. The layout
+/// height at the FIT scale, which is the leaf's height whatever the user's zoom: the leaf
+/// never changes size under a pinch (reporting the zoomed height re-laid the enclosing
+/// column out on every frame of the gesture, and the page lurched with it). A second field
+/// says whether the user is zoomed in past the fit scale: while they are, the view's own
+/// scroll view pans the zoomed page inside the leaf, both axes, like a native pan-zoom
+/// view; at the fit scale it is off and the enclosing scroll owns the gesture. The layout
 /// width only ever grows (an image landing can widen the page), so the rewrite cannot loop.
 const FIT_SCRIPT: &str = r#"(function(){
 if (window.__dayFit) return; window.__dayFit = true;
@@ -118,7 +121,7 @@ function post() {
   var d = document.documentElement, b = document.body, s = scale();
   var h = Math.ceil(d.getBoundingClientRect().height);
   if (b) h = Math.max(h, Math.ceil(b.getBoundingClientRect().height + b.offsetTop));
-  var msg = Math.ceil(h * s) + ',' + (s > fitScale + 0.01 ? 1 : 0);
+  var msg = Math.ceil(h * fitScale) + ',' + (s > fitScale + 0.01 ? 1 : 0);
   if (msg !== last) { last = msg; window.webkit.messageHandlers.dayFit.postMessage(msg); }
 }
 var ro = new ResizeObserver(post);
@@ -156,7 +159,17 @@ struct NavIvars {
     /// the view's own scroll view pans the zoomed page sideways; at the fit scale it is off
     /// so the enclosing native scroll owns every gesture.
     zoomed: Cell<bool>,
+    /// `DAY_DIAG_WEB_ZOOM` drove its one zoom on this view.
+    diag_zoomed: Cell<bool>,
 }
+
+/// `DAY_DIAG_WEB`: log every fit report. `DAY_DIAG_WEB_ZOOM=<factor>`: drive one zoom per
+/// fit-width view (see `did_receive_message`).
+static DIAG_WEB: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var_os("DAY_DIAG_WEB").is_some());
+static DIAG_ZOOM: std::sync::LazyLock<Option<f64>> = std::sync::LazyLock::new(|| {
+    std::env::var("DAY_DIAG_WEB_ZOOM").ok().and_then(|v| v.parse().ok())
+});
 
 /// WKNavigationActionPolicy, hand-rolled like the class itself: Cancel = 0, Allow = 1.
 const POLICY_CANCEL: isize = 0;
@@ -240,15 +253,41 @@ define_class!(
                     return;
                 }
                 let zoomed = parts.next().is_some_and(|z| z.trim() == "1");
+                let web: *mut AnyObject = unsafe { msg_send![message, webView] };
+                if *DIAG_WEB {
+                    log::info!("DAYDIAG fit report h={h} zoomed={zoomed} node={:?}", self.ivars().node.get());
+                }
                 if zoomed != self.ivars().zoomed.get() {
                     self.ivars().zoomed.set(zoomed);
-                    let web: *mut AnyObject = unsafe { msg_send![message, webView] };
                     if !web.is_null() {
                         unsafe {
                             let sv: Retained<AnyObject> = msg_send![&*web, scrollView];
                             let _: () = msg_send![&*sv, setScrollEnabled: zoomed];
                         }
                     }
+                }
+                // DAY_DIAG_WEB_ZOOM=<factor>: drive a zoom to `minimumZoomScale × factor` a
+                // moment after the first report, the simulator having no pinch to inject —
+                // a check that a zoom neither re-reports the height nor moves the enclosing
+                // scroll, and that the view's scrolling comes on with it.
+                if let Some(factor) = *DIAG_ZOOM
+                    && !web.is_null()
+                    && !self.ivars().diag_zoomed.replace(true)
+                {
+                    let web: Retained<AnyObject> = unsafe { Retained::retain(web) }.expect("web view");
+                    let mtm = MainThreadMarker::new().expect("main");
+                    let bound = dispatch2::MainThreadBound::new(web, mtm);
+                    let when = dispatch2::DispatchTime::try_from(std::time::Duration::from_millis(2500)).expect("time");
+                    let _ = dispatch2::DispatchQueue::main().after(when, move || {
+                        let web = bound.into_inner(MainThreadMarker::new().expect("main"));
+                        unsafe {
+                            let sv: Retained<AnyObject> = msg_send![&*web, scrollView];
+                            let min: f64 = msg_send![&*sv, minimumZoomScale];
+                            let max: f64 = msg_send![&*sv, maximumZoomScale];
+                            let _: () = msg_send![&*sv, setZoomScale: (min * factor).min(max), animated: true];
+                            log::info!("DAYDIAG zoom driven to {} (min {min} max {max})", (min * factor).min(max));
+                        }
+                    });
                 }
                 let h = h.clamp(FIT_MIN, FIT_MAX);
                 if self.ivars().fit.get() == Some(h) {
@@ -303,6 +342,7 @@ impl WebNav {
             inline_base: RefCell::new(None),
             fit: Cell::new(fit),
             zoomed: Cell::new(false),
+            diag_zoomed: Cell::new(false),
         });
         unsafe { msg_send![super(this), init] }
     }
