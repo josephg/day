@@ -5711,9 +5711,14 @@ impl Platform for Gtk {
 
         // AdwApplication initializes libadwaita and loads the Adwaita stylesheet, so
         // AdwNavigationSplitView / AdwNavigationView render with the GNOME treatment.
-        let app = adw::Application::builder()
-            .application_id("dev.daybrite.day.app")
-            .build();
+        // The manifest's app id (the CLI exports it as DAY_APP_ID) keeps two day apps from
+        // handing off to each other through GApplication's single-instance bus name; the
+        // fixed id remains for plain `cargo run` and ids GIO would reject.
+        let app_id = std::env::var("DAY_APP_ID")
+            .ok()
+            .filter(|id| adw::gio::Application::id_is_valid(id))
+            .unwrap_or_else(|| "dev.daybrite.day.app".to_string());
+        let app = adw::Application::builder().application_id(app_id).build();
 
         // DAY_THEME=light|dark forces the Adwaita color scheme (themed CI screenshot runs and
         // local theme checks); unset ⇒ follow the system. Applied in `startup`, once libadwaita
