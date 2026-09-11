@@ -52,6 +52,10 @@ pub struct WebProps {
     /// whether the first document happens to be empty, so link policing is installed even
     /// when the app's first render has not produced a page yet.
     pub doc_mode: bool,
+    /// Whether the app listens for script messages ([`WebView::on_message`]). The channel
+    /// itself is installed on every view that can carry one; an arm that cannot logs once
+    /// when a listener asked for it, instead of failing silently.
+    pub messages: bool,
 }
 
 /// A retained browsing session — the thing that outlives the view showing it.
@@ -110,8 +114,15 @@ impl WebSession {
 // ---------------------------------------------------------------------------
 
 /// The `num` the arms tag an external-link report with on the shared `Event::Custom` channel:
-/// navigation reports are `0`, eval replies are `≥ 1`, link reports are this.
+/// navigation reports are `0`, eval replies are `≥ 1`, link reports are this, script
+/// messages are [`MESSAGE_REPORT`].
 const LINK_REPORT: f64 = -1.0;
+
+/// The `num` of a script message the page posted (docs/webview-eval.md § Script messages):
+/// `window.webkit.messageHandlers.day.postMessage(value)` on the WebKit backends, delivered
+/// to [`WebView::on_message`] with the value as text — a string as itself, anything else as
+/// its JSON.
+const MESSAGE_REPORT: f64 = -2.0;
 
 /// What to do with a navigation that leaves an inline site — the answer an
 /// [`WebView::on_external_link`] handler returns. Without a handler, every external link is
@@ -617,6 +628,7 @@ pub struct WebView {
     inline: Option<InlineSite>,
     inline_start: String,
     on_link: Option<LinkDecider>,
+    on_message: Option<Rc<dyn Fn(&str)>>,
     html: Option<Signal<String>>,
     base_url: String,
 }
@@ -643,6 +655,7 @@ pub fn web_view(url: Signal<String>) -> WebView {
         inline: None,
         inline_start: String::new(),
         on_link: None,
+        on_message: None,
         html: None,
         base_url: String::new(),
     }
@@ -736,6 +749,27 @@ impl WebView {
         self.on_link = Some(Rc::new(f));
         self
     }
+    /// Receive messages the page posts (docs/webview-eval.md § Script messages): on the
+    /// WebKit backends `window.webkit.messageHandlers.day.postMessage(value)`. A string
+    /// arrives as itself, any other value as its JSON text. Runs on the main thread; the
+    /// page keeps running, nothing is answered (pair it with [`JsHandle::eval`] for a reply).
+    /// Gate on [`message_support`].
+    pub fn on_message(mut self, f: impl Fn(&str) + 'static) -> Self {
+        self.on_message = Some(Rc::new(f));
+        self
+    }
+}
+
+/// Whether this backend delivers the page's script messages to [`WebView::on_message`].
+/// GTK (linux) has the `UserContentManager` channel; the other arms have their engine's
+/// equivalent (`WKUserContentController`, `addJavascriptInterface`, `QWebChannel`,
+/// `WebMessage`, `javaScriptProxy`) but no arm yet, and report `Unsupported`.
+pub fn message_support() -> day_spec::Support {
+    if cfg!(all(feature = "gtk", not(target_os = "macos"), not(windows))) {
+        day_spec::Support::Native
+    } else {
+        day_spec::Support::Unsupported
+    }
 }
 
 /// What this backend realizes. `Native` is a real embedded browser engine with the full command
@@ -781,10 +815,12 @@ impl Piece for WebView {
             inline,
             inline_start,
             on_link,
+            on_message,
             html,
             base_url,
         } = self;
         let initial = WebProps {
+            messages: on_message.is_some(),
             url: url.get_untracked(),
             session: session.map(WebSession::id).unwrap_or(0),
             inline_root: inline.as_ref().map(|s| s.root.clone()).unwrap_or_default(),
@@ -851,15 +887,20 @@ impl Piece for WebView {
             js.node.set(Some(node));
         }
 
-        // Two kinds of report share this node's `Event::Custom` channel, told apart by `num`:
-        // 0 is navigation (the URL, so a bound text field follows along), anything else is an
-        // evaluation reply keyed by its request id. In-process backends also tag them, but a
-        // cross-boundary Custom (JNI, C-ABI) carries only `num`/`text` — so `num` is the
-        // discriminator that works everywhere (§8.2's opened event channel).
+        // Several kinds of report share this node's `Event::Custom` channel, told apart by
+        // `num`: 0 is navigation (the URL, so a bound text field follows along), ≥ 1 an
+        // evaluation reply keyed by its request id, and the negative reserved values below.
+        // In-process backends also tag them, but a cross-boundary Custom (JNI, C-ABI)
+        // carries only `num`/`text` — so `num` is the discriminator that works everywhere
+        // (§8.2's opened event channel).
         cx.on(node, move |ev| {
             if let Event::Custom { num, text, .. } = ev {
                 if *num >= 1.0 {
                     resolve(*num as u64, text);
+                } else if *num == MESSAGE_REPORT {
+                    if let Some(f) = &on_message {
+                        f(text);
+                    }
                 } else if *num == LINK_REPORT {
                     // An inline site's navigation left the site: the arm already CANCELLED it
                     // (§8.3 events are enqueue-only, so the native side can't ask), and the
@@ -915,6 +956,7 @@ pub trait WebViewBuilder: Sized {
     fn session(self, session: WebSession) -> Self;
     fn start_page(self, page: impl Into<String>) -> Self;
     fn on_external_link(self, f: impl Fn(&str) -> LinkPolicy + 'static) -> Self;
+    fn on_message(self, f: impl Fn(&str) + 'static) -> Self;
 }
 
 impl WebViewBuilder for WebView {
@@ -944,6 +986,9 @@ impl WebViewBuilder for WebView {
     }
     fn on_external_link(self, f: impl Fn(&str) -> LinkPolicy + 'static) -> Self {
         WebView::on_external_link(self, f)
+    }
+    fn on_message(self, f: impl Fn(&str) + 'static) -> Self {
+        WebView::on_message(self, f)
     }
 }
 
@@ -976,6 +1021,9 @@ impl<Inner: WebViewBuilder + day_pieces::prelude::Piece> WebViewBuilder
     }
     fn on_external_link(self, f: impl Fn(&str) -> LinkPolicy + 'static) -> Self {
         self.map_inner(|inner_piece| inner_piece.on_external_link(f))
+    }
+    fn on_message(self, f: impl Fn(&str) + 'static) -> Self {
+        self.map_inner(|inner_piece| inner_piece.on_message(f))
     }
 }
 

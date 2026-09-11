@@ -74,6 +74,40 @@ spends the wait then fails where the backend's arm reports `Unsupported`; gate i
 Goal: `js.eval("document.title").await` returning a value from the embedded engine, on every backend
 that has one.
 
+## Script messages: page → Rust
+
+`JsHandle::eval` is Rust asking the page. The reverse direction — the page telling Rust
+something on its own schedule (a form was submitted, an editor's content changed, the
+document's height) — is a **script message**:
+
+```rust
+web_view_html(doc)
+    .on_message(|text| log::info!("page says {text}"))
+```
+
+```js
+window.webkit.messageHandlers.day.postMessage({kind: "height", value: 812});
+```
+
+The handler is registered under the name **`day`** in the page's main world on every view the
+piece creates, so a document never has to know whether anyone is listening; a string arrives
+as itself, any other value as its JSON text (`undefined`, a function or a cycle arrive as
+`null`). Messages are one-way and unanswered: the page keeps running, and a reply goes back
+through `eval`. Delivery is on the main thread through the same `Event::Custom` channel the
+other reports use, with the reserved `num = -2` (`MESSAGE_REPORT`; navigation is `0`, evals
+`≥ 1`, links `-1`, [fit-content heights](#fit-content-heights) `-3`), so an arm needs
+nothing beyond its engine's message hook. Gate on `message_support()`.
+
+| backend | channel | status |
+|---|---|---|
+| GTK | `WebKitUserContentManager`: `register_script_message_handler("day")` + `script-message-received::day` — one manager per view (it is a construct-only property), the `JSCValue` read as string or JSON | **shipped** (linux-gtk, verified in fastmail-native) |
+| AppKit / UIKit | `WKUserContentController.addScriptMessageHandler(_:name:)` on the view's configuration, a `WKScriptMessageHandler` delegate; the same `window.webkit.messageHandlers.day` spelling | not written (no Mac to run it); a listener logs one warning |
+| Android | `addJavascriptInterface` (a `@JavascriptInterface` object named `day`, so the spelling differs: `day.postMessage(...)`) | not written |
+| Qt | `QWebChannel` over `qt.webChannelTransport`, or a `runJavaScript` poll | not written |
+| XAML | `CoreWebView2.WebMessageReceived` (`window.chrome.webview.postMessage`) | not written |
+| ArkUI | `javaScriptProxy` | not written |
+| web-dom | `window.postMessage` from the same-origin inline frame only | not written |
+
 ## The short answer
 
 Every backend with a real engine offers the same primitive: submit a script string, get one value

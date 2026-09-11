@@ -12,12 +12,12 @@ use super::*;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
+use block2::RcBlock;
 use day_spec::NodeId;
 use day_uikit::Uikit;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject, NSObjectProtocol};
 use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, extern_class, msg_send};
-use block2::RcBlock;
 use objc2_foundation::{NSError, NSString, NSURL, NSURLRequest};
 use objc2_ui_kit::{UIResponder, UIView};
 
@@ -148,8 +148,13 @@ fn load_url(web: &WKWebView, url: &str) {
 
 fn load_html(web: &WKWebView, html: &str, base: &str) {
     let ns = NSString::from_str(html);
-    let base_url = if base.is_empty() { None } else { NSURL::URLWithString(&NSString::from_str(base)) };
-    let _: *mut AnyObject = unsafe { msg_send![web, loadHTMLString: &*ns, baseURL: base_url.as_deref()] };
+    let base_url = if base.is_empty() {
+        None
+    } else {
+        NSURL::URLWithString(&NSString::from_str(base))
+    };
+    let _: *mut AnyObject =
+        unsafe { msg_send![web, loadHTMLString: &*ns, baseURL: base_url.as_deref()] };
 }
 
 fn make(_backend: &mut Uikit, p: &WebProps, id: NodeId) -> Retained<UIView> {
@@ -172,6 +177,13 @@ fn make(_backend: &mut Uikit, p: &WebProps, id: NodeId) -> Retained<UIView> {
     let web: Retained<WKWebView> = unsafe { msg_send![WKWebView::alloc(mtm), init] };
     let nav = WebNav::new(mtm, id);
     let _: () = unsafe { msg_send![&web, setNavigationDelegate: &*nav] };
+    // NOTE: script messages (`WebView::on_message`) need a `WKUserContentController` with an
+    // `addScriptMessageHandler:name:` delegate on this view's configuration (the `day`
+    // handler, as the GTK arm registers); this arm is written without a Mac and does not
+    // install one yet, so a listener is told once rather than silently ignored.
+    if p.messages {
+        log::warn!("day-piece-webview: on_message is not delivered on this backend yet");
+    }
     if !p.inline_root.is_empty() {
         // Inline mode (docs/webview.md): the assets tree is loose files in the app bundle, so
         // `loadFileURL:allowingReadAccessToURL:` with the site ROOT is the whole load path —

@@ -81,11 +81,14 @@ define_class!(
                     } else if inside {
                         WKNavigationActionPolicy::Allow
                     } else {
-                        day_appkit::emit(self.ivars().node.get(), Event::Custom {
-                            tag: "webview:link",
-                            num: super::LINK_REPORT,
-                            text: url,
-                        });
+                        day_appkit::emit(
+                            self.ivars().node.get(),
+                            Event::Custom {
+                                tag: "webview:link",
+                                num: super::LINK_REPORT,
+                                text: url,
+                            },
+                        );
                         WKNavigationActionPolicy::Cancel
                     }
                 }
@@ -139,8 +142,13 @@ fn load_url(web: &WKWebView, url: &str) {
 
 fn load_html(web: &WKWebView, html: &str, base: &str) {
     let ns = NSString::from_str(html);
-    let base_url = if base.is_empty() { None } else { NSURL::URLWithString(&NSString::from_str(base)) };
-    let _: *mut AnyObject = unsafe { msg_send![web, loadHTMLString: &*ns, baseURL: base_url.as_deref()] };
+    let base_url = if base.is_empty() {
+        None
+    } else {
+        NSURL::URLWithString(&NSString::from_str(base))
+    };
+    let _: *mut AnyObject =
+        unsafe { msg_send![web, loadHTMLString: &*ns, baseURL: base_url.as_deref()] };
 }
 
 fn make(backend: &mut AppKit, p: &WebProps, id: NodeId) -> Retained<NSView> {
@@ -164,6 +172,13 @@ fn make(backend: &mut AppKit, p: &WebProps, id: NodeId) -> Retained<NSView> {
     let web = unsafe { WKWebView::new(mtm) };
     let nav = WebNav::new(mtm, id);
     unsafe { web.setNavigationDelegate(Some(ProtocolObject::from_ref(&*nav))) };
+    // NOTE: script messages (`WebView::on_message`) need a `WKUserContentController` with an
+    // `addScriptMessageHandler:name:` delegate on this view's configuration (the `day`
+    // handler, as the GTK arm registers); this arm is written without a Mac and does not
+    // install one yet, so a listener is told once rather than silently ignored.
+    if p.messages {
+        log::warn!("day-piece-webview: on_message is not delivered on this backend yet");
+    }
     if !p.inline_root.is_empty() {
         // Inline mode (docs/webview.md): the bundled site is loose files (the assets tree in
         // the bundle, or the project's `resource/assets/` under `day launch`), so a file URL
@@ -236,11 +251,14 @@ fn eval(web: &WKWebView, node: NodeId, req: u64, script: &str) {
         } else {
             engine_error("WebKitError", "no result")
         };
-        day_appkit::emit(node, Event::Custom {
-            tag: "webview:eval",
-            num: req as f64,
-            text: payload,
-        });
+        day_appkit::emit(
+            node,
+            Event::Custom {
+                tag: "webview:eval",
+                num: req as f64,
+                text: payload,
+            },
+        );
     });
     // SAFETY: main thread (a renderer duty), and WebKit copies the block before returning.
     unsafe { web.evaluateJavaScript_completionHandler(&js, Some(&handler)) };

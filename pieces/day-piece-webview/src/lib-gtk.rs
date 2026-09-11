@@ -71,8 +71,29 @@ fn extract_tree(res_dir: &str, dest: &std::path::Path) -> Result<(), String> {
     Ok(())
 }
 
+/// The script-message handler name: `window.webkit.messageHandlers.day.postMessage(v)`.
+const MESSAGE_HANDLER: &str = "day";
+
 fn make(_backend: &mut Gtk, p: &WebProps, id: NodeId) -> gtk4::Widget {
-    let wv = webkit6::WebView::new();
+    // The page → Rust channel (docs/webview-eval.md § Script messages): one content manager
+    // per view (it is a construct-only property), the `day` handler registered in the main
+    // world. The value crosses as a JSCValue; a string is delivered as itself, anything
+    // else as its JSON, so the app sees one shape whatever the page posted.
+    let ucm = webkit6::UserContentManager::new();
+    ucm.register_script_message_handler(MESSAGE_HANDLER, None);
+    ucm.connect_script_message_received(Some(MESSAGE_HANDLER), move |_ucm, value| {
+        day_gtk::emit(
+            id,
+            Event::Custom {
+                tag: "webview:message",
+                num: super::MESSAGE_REPORT,
+                text: message_text(value),
+            },
+        );
+    });
+    let wv = webkit6::WebView::builder()
+        .user_content_manager(&ucm)
+        .build();
     let state = Rc::new(ViewState {
         node: id,
         base: Rc::new(RefCell::new(p.base_url.clone())),
@@ -217,6 +238,19 @@ struct ViewState {
 
 thread_local! {
     static VIEWS: RefCell<HashMap<usize, Rc<ViewState>>> = RefCell::new(HashMap::new());
+}
+
+/// A posted script message as text: a string as itself, anything else as its JSON
+/// (`undefined`, a function or a cycle serialize to nothing — reported as `null`).
+fn message_text(value: &webkit6::javascriptcore::Value) -> String {
+    if value.is_string() {
+        value.to_str().to_string()
+    } else {
+        value
+            .to_json(0)
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "null".to_string())
+    }
 }
 
 fn state_of(wv: &webkit6::WebView) -> Option<Rc<ViewState>> {

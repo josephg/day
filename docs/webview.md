@@ -68,7 +68,10 @@ Evaluating JavaScript and reading a value back is covered in [docs/webview-eval.
 `eval_support()` before offering it: AppKit, UIKit, GTK, Qt, XAML, Android and ArkWeb have
 working arms; windows-qt ships no engine (and macos-gtk/windows-gtk have no WebKitGTK), and
 web-dom can never have one (`contentWindow.eval` throws across origins). See [webview-eval.md](./webview-eval.md) for
-the per-platform research, the JavaScript envelope, and what each arm does.
+the per-platform research, the JavaScript envelope, and what each arm does. The reverse
+direction — the page posting to Rust with `window.webkit.messageHandlers.day.postMessage(v)`,
+received by `.on_message(|text| ..)` — is in the same document (§ Script messages); GTK has
+the arm, gate on `message_support()`.
 
 ### Sessions (surviving navigation)
 
