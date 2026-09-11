@@ -340,6 +340,10 @@ fn load_url(web: &WKWebView, url: &str) {
     let _: *mut AnyObject = unsafe { msg_send![web, loadRequest: &*req] };
 }
 
+/// NOTE: `loadHTMLString:baseURL:` resolves relative references against a `file://` base,
+/// but whether WebKit lets the page READ files beside that base is not verified here (the
+/// documented grant is `loadFileURL:allowingReadAccessToURL:`). A document whose images
+/// live beside it may need writing out and loading through that call instead.
 fn load_html(web: &WKWebView, html: &str, base: &str) {
     let ns = NSString::from_str(html);
     let base_url = base_nsurl(base);
