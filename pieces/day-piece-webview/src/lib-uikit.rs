@@ -377,6 +377,16 @@ fn make(_backend: &mut Uikit, p: &WebProps, id: NodeId) -> Retained<UIView> {
     let zero = CGRect { origin: CGPoint { x: 0.0, y: 0.0 }, size: CGSize { width: 0.0, height: 0.0 } };
     let web: Retained<WKWebView> =
         unsafe { msg_send![WKWebView::alloc(mtm), initWithFrame: zero, configuration: &*cfg] };
+    // The view shows what is behind it where the document paints nothing: a WKWebView is
+    // opaque by default and paints the system background (black in dark mode) under a
+    // transparent document, which put a black block inside every card the app painted
+    // its own page colour. The scroll view has its own ground to clear as well.
+    unsafe {
+        web.setOpaque(false);
+        web.setBackgroundColor(None);
+        let sv: Retained<AnyObject> = msg_send![&web, scrollView];
+        let _: () = msg_send![&*sv, setBackgroundColor: std::ptr::null::<AnyObject>()];
+    }
     // The app's estimate (`estimated_height`) opens a fit view at about its final size.
     let fit = p.fit.then(|| p.fit_estimate.clamp(FIT_MIN, FIT_MAX));
     let nav = WebNav::new(mtm, id, fit);
