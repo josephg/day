@@ -17,7 +17,7 @@ day_reactive::tls_slots! {
 
 use day_spec::*;
 
-use crate::tree::{Flex, RNode, Tree, TreeOps};
+use crate::tree::{Flex, FrameReport, RNode, Tree, TreeOps};
 
 /// Open layout protocol (§7.2). `children` are the node's direct children; group nodes
 /// (`when`/`each` anchors) are layout-transparent — stacks expand them inline.
@@ -279,21 +279,16 @@ pub(crate) fn place_node<B: Toolkit>(
                     let anim = tree.resolve_anim(node);
                     tree.toolkit.set_frame(&h, abs, anim.as_ref());
                 }
-                match tree.node(node).map(|n| n.kind) {
-                    Some(day_spec::kinds::CANVAS) => {
-                        // Queue-only (§8.3): canvases re-record against the new size after
-                        // layout.
-                        crate::tree::enqueue_event(
-                            crate::tree::rnode_to_id(node),
-                            day_spec::Event::FrameChanged(abs.size),
-                        );
-                    }
-                    Some(day_spec::kinds::SCROLL) => {
-                        // A resized viewport shows a different slice of the content: report
-                        // it as a scroll so one listener covers every cause (docs/scroll.md).
-                        tree.report_scroll(node);
-                    }
-                    _ => {}
+                if tree
+                    .node(node)
+                    .map(|n| n.kind == day_spec::kinds::CANVAS)
+                    .unwrap_or(false)
+                {
+                    // Queue-only (§8.3): canvases re-record against the new size after layout.
+                    crate::tree::enqueue_event(
+                        crate::tree::rnode_to_id(node),
+                        day_spec::Event::FrameChanged(abs.size),
+                    );
                 }
             }
         }
@@ -301,6 +296,24 @@ pub(crate) fn place_node<B: Toolkit>(
     } else {
         abs.origin
     };
+    // A resized scroll viewport shows a different slice of the content: report it as a
+    // scroll so one listener covers every cause (docs/scroll.md). Outside the native-frame
+    // block above because a scroll at a window's root is never re-framed (the toolkit sizes
+    // the root) yet its viewport still changes with the window; on the SIZE only — a
+    // viewport that merely moves shows the same slice.
+    let scroll_resized = tree
+        .node(node)
+        .map(|n| {
+            n.handle.is_some()
+                && n.kind == day_spec::kinds::SCROLL
+                && n.last_native_frame
+                    .map(|f| !f.size.approx_eq(abs.size, 0.25))
+                    .unwrap_or(true)
+        })
+        .unwrap_or(false);
+    if scroll_resized {
+        tree.report_scroll(node);
+    }
     // A LIST whose width changes re-lays its bound cells in THIS pass: the native table
     // resizes the physical cell views, but each cell's day content keeps the old width's
     // placement until laid out again (a trailing control would sit clipped after a
@@ -315,29 +328,28 @@ pub(crate) fn place_node<B: Toolkit>(
                     .unwrap_or(false)
         })
         .unwrap_or(false);
-    let wants_frame_report = tree
+    let frame_report = tree
         .node_mut(node)
         .map(|n| {
             n.last_native_frame = Some(abs);
-            n.frame_report.is_some()
+            n.frame_report
         })
-        .unwrap_or(false);
-    if wants_frame_report {
+        .unwrap_or(FrameReport::Off);
+    if frame_report != FrameReport::Off {
         // `on_frame` (docs/scroll.md): the frame that matters to a listener is the one in its
         // enclosing scroll's content space — ancestors are placed before their children, so
         // theirs are current here. Diffed against the last report, queue-only (§8.3). Canvases
         // report their own resize above; a canvas that also asked for this gets one event per
         // cause, which its re-record de-duplicates by content.
         let now = tree.content_frame(node).map(|(_, r)| r);
-        let last = tree.node(node).and_then(|n| n.frame_report).flatten();
-        let moved = match (now, last) {
-            (Some(a), Some(b)) => !a.approx_eq(&b, 0.25),
-            (Some(_), None) => true,
+        let moved = match (now, frame_report) {
+            (Some(a), FrameReport::Last(b)) => !a.approx_eq(&b, 0.25),
+            (Some(_), _) => true,
             (None, _) => false,
         };
-        if moved {
+        if moved && let Some(now) = now {
             if let Some(n) = tree.node_mut(node) {
-                n.frame_report = Some(now);
+                n.frame_report = FrameReport::Last(now);
             }
             crate::tree::enqueue_event(
                 crate::tree::rnode_to_id(node),

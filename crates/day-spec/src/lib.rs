@@ -2151,9 +2151,10 @@ pub enum Cap {
     /// row rail) emits [`Event::ScrollChanged`] as the user scrolls, coalesced to at most one
     /// report per frame, and answers [`Toolkit::scroll_offset`] with the live position
     /// (docs/scroll.md § Reading the position). Programmatic scrolls and layout changes are
-    /// reported by day-core on every backend regardless; this says whether the USER's
-    /// scrolling reaches the app too. `Unsupported` ⇒ `scroll(..).on_scroll(..)` hears only
-    /// the programmatic and layout-driven reports.
+    /// reported by day-core itself, through `scroll_offset` — so only where this is answered:
+    /// an arm without the duty would report every position as zero, and a listener would
+    /// take the top of the content for what is on screen. `Unsupported` ⇒
+    /// `scroll(..).on_scroll(..)` never runs.
     ScrollReports,
 }
 
