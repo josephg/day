@@ -755,11 +755,13 @@ impl<S: RowSource + 'static> List<S> {
     /// Hear where the native list's own scroller is (docs/list.md § Reading the position):
     /// `f` runs with a [`day_core::ScrollState`] whose `offset` and `viewport` are the row
     /// rail's, and whose `content` is the rows' extent — `rows × pitch` under
-    /// [`RowHeight::Uniform`], the viewport otherwise (an `Automatic` list's extent is the
-    /// host's alone). With a uniform pitch the visible rows are
+    /// [`RowHeight::Uniform`]; under [`RowHeight::Automatic`] the extent is the host's alone
+    /// and `content` is `Size::ZERO`, unknown (so `max_offset()` reads zero too). With a
+    /// uniform pitch the visible rows are
     /// `offset.y / pitch ..= (offset.y + viewport.height) / pitch`, which is what a list
     /// that prefetches for the rows on screen needs. Reported by the toolkits that answer
-    /// `Cap::ScrollReports`, at most once per frame, at an event drain.
+    /// `Cap::ScrollReports`, at most once per frame, once per distinct state, at an event
+    /// drain; elsewhere `f` never runs.
     pub fn on_scroll(mut self, f: impl Fn(day_core::ScrollState) + 'static) -> Self {
         self.on_scroll.push(Rc::new(f));
         self
@@ -1060,20 +1062,28 @@ impl<S: RowSource + 'static> Piece for List<S> {
                 RowHeight::Uniform(h) => Some(h),
                 RowHeight::Automatic => None,
             };
+            let last = std::cell::Cell::new(None::<day_core::ScrollState>);
             cx.on(node, move |ev| {
                 if let Event::ScrollChanged(offset) = ev {
                     let viewport = with_tree(|t| t.node_frame(node))
                         .map(|f| f.size)
                         .unwrap_or_default();
+                    // Unknown under `Automatic`: the host owns the extent and does not
+                    // tell day, and a made-up number would only be believed.
                     let content = match pitch {
                         Some(h) => day_spec::Size::new(viewport.width, h * conn.len() as f64),
-                        None => viewport,
+                        None => day_spec::Size::ZERO,
                     };
                     let st = day_core::ScrollState {
                         offset: *offset,
                         viewport,
                         content,
                     };
+                    // One callback per distinct state (a toolkit may notify twice for one
+                    // move: `value-changed` and then `upper` from the same relayout).
+                    if last.replace(Some(st)) == Some(st) {
+                        return;
+                    }
                     for f in &listeners {
                         f(st);
                     }

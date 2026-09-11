@@ -220,14 +220,20 @@ scroll-to-index (GTK ≤ 4.10, Qt, XAML, web) position by uniform row pitch; pre
 `list(..).on_scroll(|st: ScrollState| ..)` is the row rail's counterpart to
 `scroll(..).on_scroll(..)` ([docs/scroll.md](scroll.md) § Reading the position): `st.offset`
 and `st.viewport` are the native list's own scroller's, and `st.content` is the rows' extent
-— `rows × pitch` under `RowHeight::Uniform`, the viewport itself under `Automatic` (the host
-owns that extent and does not tell Day). With a uniform pitch the rows on screen are
-`offset.y / pitch ..= (offset.y + viewport.height) / pitch`, which is what a list that
+— `rows × pitch` under `RowHeight::Uniform`; under `Automatic` it is **unknown** and reads
+`Size::ZERO` (the host owns that extent and does not tell Day; `max_offset()` is zero too, so
+check `content.height > 0.0` before leaning on it). With a uniform pitch the rows on screen
+are `offset.y / pitch ..= (offset.y + viewport.height) / pitch`, which is what a list that
 prefetches for what it shows needs (Fastmail's `MessageDetailsPreloader` works on exactly
 that range). Reported by the toolkits that answer `Cap::ScrollReports` — GTK, from the
 `GtkScrolledWindow` around the `GtkListView` (its `value-changed`, `page-size` and `upper`
-notifications, one report per frame) — at an event drain; `stick_to_bottom`'s "is the user
-already near the bottom" refinement can now be built on it.
+notifications, one report per frame) — at an event drain, one callback per distinct state;
+`stick_to_bottom`'s "is the user already near the bottom" refinement can now be built on it.
+
+A cell is a boundary for `.on_frame(..)`: a piece inside a row reports its frame relative to
+the cell, never accumulated through the list's own frame — the rail scrolls the cell
+natively, and where the cell is on screen is the row rail's to say (`on_scroll` above, with
+the row's index under a uniform pitch).
 
 A Reload whose rows are the same set in a new order (a shuffle, a programmatic sort) animates
 as native row moves on AppKit (`moveRowAtIndex` batch, the same animation a drag commit gets);

@@ -455,12 +455,14 @@ impl<P: Piece> Scroll<P> {
     }
 
     /// Hear where the viewport is (docs/scroll.md § Reading the position): `f` runs with the
-    /// live [`ScrollState`] — offset, viewport, content — after the user scrolls (where the
-    /// toolkit reports it, `Cap::ScrollReports`), after every programmatic scroll, and when
-    /// layout changes the viewport or the content size; at most once per frame for a
-    /// gesture, and only ever at an event drain (§8.3), never inside the native callback.
-    /// Pair with [`Decorate::on_frame`](crate::Decorate::on_frame) on a child to know
-    /// whether that child is on screen: both speak the scroll's content space.
+    /// live [`ScrollState`] — offset, viewport, content — after the user scrolls, after every
+    /// programmatic scroll, and when layout changes the viewport or the content size; at
+    /// most once per frame for a gesture, once per distinct state (a toolkit's echo of a
+    /// programmatic scroll is absorbed here), and only ever at an event drain (§8.3), never
+    /// inside the native callback. Only on the toolkits that answer `Cap::ScrollReports`;
+    /// elsewhere `f` never runs. Pair with [`Decorate::on_frame`](crate::Decorate::on_frame)
+    /// on a child to know whether that child is on screen: both speak the scroll's content
+    /// space.
     ///
     /// ```ignore
     /// scroll(cards).on_scroll(move |st| visible.set(st.visible_rect()));
@@ -471,7 +473,7 @@ impl<P: Piece> Scroll<P> {
     }
 
     /// The same reports, kept in a signal: `sig` follows the scroll's [`ScrollState`]
-    /// (`set_if_changed`, so a duplicate report wakes nothing). Read it from any binding
+    /// (`set_if_changed`, so a repeated write wakes nothing). Read it from any binding
     /// that wants to track the position — the read side of
     /// [`scroll_target`](Self::scroll_target).
     pub fn scroll_state(self, sig: Signal<ScrollState>) -> Self {
@@ -499,6 +501,7 @@ impl<P: Piece> Piece for Scroll<P> {
         });
         if !self.on_scroll.is_empty() {
             let listeners = self.on_scroll;
+            let last = std::cell::Cell::new(None::<ScrollState>);
             cx.on(node, move |ev| {
                 if let day_spec::Event::ScrollChanged(offset) = ev {
                     // The event carries the offset the toolkit saw when it reported; the
@@ -508,6 +511,11 @@ impl<P: Piece> Piece for Scroll<P> {
                         return;
                     };
                     st.offset = *offset;
+                    // One callback per distinct state: a `scroll_to` is reported by day-core
+                    // and again by a toolkit that notifies from its own set_value.
+                    if last.replace(Some(st)) == Some(st) {
+                        return;
+                    }
                     for f in &listeners {
                         f(st);
                     }

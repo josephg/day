@@ -1238,12 +1238,15 @@ pub trait Decorate: Piece + Sized {
 
     /// Hear where this piece is (docs/scroll.md § Reading the position): `f` runs with the
     /// piece's frame in the content space of its nearest enclosing `scroll` — the space
-    /// [`ScrollState::visible_rect`](day_core::ScrollState::visible_rect) is in — or of the
-    /// window when no scroll encloses it, whenever layout moves or resizes it (a card above
-    /// growing moves this one; the report follows). Reported from layout, queue-only (§8.3),
-    /// so it arrives at the drain after the layout that placed it, like a canvas's
-    /// `FrameChanged`. Combine with `scroll(..).on_scroll(..)` to know whether the piece is
-    /// on screen; the frame alone says nothing about the viewport.
+    /// [`ScrollState::visible_rect`](day_core::ScrollState::visible_rect) is in — of the
+    /// window when no scroll encloses it, or of its list cell when it sits inside a `list`
+    /// (the cell is natively scrolled; the walk stops there), whenever layout moves or
+    /// resizes it (a card above growing moves this one; the report follows). The frame is
+    /// layout's: a `.transform(..)` on the piece or an ancestor is applied by the toolkit
+    /// after placement and is not part of it. Reported from layout, queue-only (§8.3), so it
+    /// arrives at the drain after the layout that placed it, like a canvas's `FrameChanged`.
+    /// Combine with `scroll(..).on_scroll(..)` to know whether the piece is on screen; the
+    /// frame alone says nothing about the viewport.
     fn on_frame(self, f: impl Fn(day_spec::Rect) + 'static) -> Decorated<Self> {
         Decorated::new(self).on_frame(f)
     }
