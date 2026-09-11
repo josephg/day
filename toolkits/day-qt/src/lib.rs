@@ -2221,6 +2221,9 @@ impl Toolkit for Qt {
                                 // (`Cap::NavContentList` = Native), so the pieces layer never
                                 // asks for the merged-stack shape.
                                 NavPatch::ListInStack(_) => {}
+                                // The pane's own bar is the window toolbar's track here; a
+                                // title for it is not drawn (docs/navigation.md).
+                                NavPatch::ListTitle(_) => {}
                             }
                         });
                         if let Some((pane, shown, place)) = list_apply {

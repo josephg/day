@@ -985,6 +985,7 @@ impl Toolkit for MockToolkit {
                     // Logged only: mock answers `Cap::NavContentList` Unsupported, so the pieces
                     // layer composes and these arrive solely in tests that force the cap.
                     NavPatch::ListVisible(v) => format!("nav list visible={v}"),
+                    NavPatch::ListTitle(t) => format!("nav list title={t:?}"),
                     NavPatch::ListInStack(v) => format!("nav list in-stack={v}"),
                 }
             } else if let Some(p) = patch.downcast_ref::<CoverPatch>() {

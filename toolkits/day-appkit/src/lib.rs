@@ -5958,6 +5958,8 @@ impl Toolkit for AppKit {
                             // (`Cap::NavContentList` = Native), so the pieces layer never asks
                             // for the merged-stack shape.
                             NavPatch::ListInStack(_) => {}
+                            // The content-list pane has no title bar of its own on macOS.
+                            NavPatch::ListTitle(_) => {}
                         }
                     });
                 }

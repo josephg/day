@@ -843,6 +843,9 @@ pub struct Nav<S: Binding<K>, K: Route = String> {
     /// The navigation-bar title of the detail layer a content list opens
     /// ([`Nav::detail_title`]). `None` = the destination's own title.
     detail_title: Option<TextSource>,
+    /// The navigation-bar title of the CONTENT-LIST layer ([`Nav::content_list_title`]).
+    /// `None` = the host's own title.
+    content_list_title: Option<TextSource>,
 }
 
 /// A pending search declaration ([`Nav::searchable`] and its modifiers). The query and the
@@ -1061,6 +1064,7 @@ pub fn nav<K: Route, S: Binding<K>>(selection: S) -> Nav<S, K> {
         content_list_pred: None,
         detail_visible: None,
         detail_title: None,
+        content_list_title: None,
     }
 }
 
@@ -1186,6 +1190,17 @@ impl<K: Route, S: Binding<K>> Nav<S, K> {
     /// Unset, the detail layer keeps its destination's title.
     pub fn detail_title<M>(mut self, t: impl IntoText<M>) -> Self {
         self.detail_title = Some(t.into_text());
+        self
+    }
+    /// The navigation-bar title of the CONTENT-LIST layer (docs/navigation.md): the list a
+    /// phone shows between the sidebar rows and the pushed detail, the list column's bar
+    /// where the toolkit titles one. Reactive like every title — a closure reading the
+    /// selected section's name titles the list after what it is scoped to (a mailbox), and
+    /// the native bar follows as that state changes. Unset, the list carries the host's
+    /// own title. Where the toolkit composes the pane itself (`Cap::NavContentList`
+    /// `Unsupported`) the pane has no bar, and the app draws its own heading.
+    pub fn content_list_title<M>(mut self, t: impl IntoText<M>) -> Self {
+        self.content_list_title = Some(t.into_text());
         self
     }
     /// Add a destination. `key` addresses it (navigate / deep link / dayscript); `title` is
@@ -2274,6 +2289,7 @@ fn build_selector<K: Route, S: Binding<K>>(sel: Nav<S, K>, cx: &mut BuildCx) -> 
     // list keeps its own container rather than pushing onto this host.
     let list_build = sel.content_list.clone();
     let list_pred = sel.content_list_pred.clone();
+    let list_title = sel.content_list_title.clone();
     let detail_visible = sel.detail_visible;
     // Whether the content-list pane belongs to THIS destination (`content_list_for`), applied
     // wherever the shown destination can change. It lives here, shared, because three paths
@@ -2306,12 +2322,18 @@ fn build_selector<K: Route, S: Binding<K>>(sel: Nav<S, K>, cx: &mut BuildCx) -> 
         let page = nav_page(
             host,
             &NavPageProps {
-                title: title_s.clone(),
+                title: list_title.as_ref().map_or_else(|| title_s.clone(), TextSource::initial),
                 pane: Pane::List,
             },
             &sizes,
         );
         list_cell.set(Some(page));
+        // Live retitle of the list layer's bar (`content_list_title`): the source re-resolves
+        // as the app's state changes and the host's list page follows via `ListTitle`.
+        // Host-owned, like the page itself.
+        if let Some(lt) = list_title.clone() {
+            lt.bind_to(host, |t| Box::new(NavPatch::ListTitle(t)), false);
+        }
         // The pane collapses for a destination that spans the whole detail area
         // (`content_list_for`), and a collapsed pane's commands must leave the bar with it
         // (docs/toolbars.md) — otherwise a full-page section shows the list's Add and Filter.

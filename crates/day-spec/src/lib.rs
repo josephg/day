@@ -4564,6 +4564,12 @@ pub mod props {
         /// [`NavProps::list_width`] is set. Applied directly, not through an animator proxy —
         /// the screenshot seam captures the instant the patch returns (the sidebar-toggle rule).
         ListVisible(bool),
+        /// Retitle the CONTENT-LIST page ([`Pane::List`]) — `Nav::content_list_title`, live:
+        /// the list layer's navigation bar names what the list is scoped to (a mailbox), so
+        /// it follows the app's state the way `NavPatch::Title` follows the detail's. Only
+        /// sent to hosts whose [`NavProps::list_width`] is set; a backend that composes the
+        /// pane itself ignores it.
+        ListTitle(String),
         /// STACKED presentations on a merged-pane backend ([`crate::Cap::NavContentList`]
         /// `Emulated`) only: the resident [`Pane::List`] page joins (`true`) or leaves
         /// (`false`) the navigation stack directly above the sidebar root. The pieces layer

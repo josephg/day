@@ -2654,7 +2654,7 @@ fn nav_patch(el: u32, p: &NavPatch) {
             NavPatch::Presentation(_) => {}
             // Never arrives: this backend answers `Cap::NavContentList` Unsupported, so the
             // pieces layer composes the pane itself (docs/navigation.md).
-            NavPatch::ListVisible(_) | NavPatch::ListInStack(_) => {}
+            NavPatch::ListVisible(_) | NavPatch::ListTitle(_) | NavPatch::ListInStack(_) => {}
             // Resident-page switch (docs/navigation.md): every page stays in the DOM and only
             // one is displayed, so a tab switch costs a `display` flip and keeps the other
             // tabs' scroll offsets and focused fields exactly as the user left them.

@@ -1697,7 +1697,7 @@ mod imp {
                             // Never arrives: this backend answers `Cap::NavContentList`
                             // Unsupported, so the pieces layer composes the pane itself
                             // (docs/navigation.md).
-                            NavPatch::ListVisible(_) | NavPatch::ListInStack(_) => {}
+                            NavPatch::ListVisible(_) | NavPatch::ListTitle(_) | NavPatch::ListInStack(_) => {}
                         }
                     }
                 }

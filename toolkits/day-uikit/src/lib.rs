@@ -3195,6 +3195,9 @@ mod imp {
         let supplementary_nav = triple.then(|| {
             let snav = DayNavController::new(mtm, 0);
             unsafe {
+                // The content-list page asks for a large title (`content_list_title`); the
+                // bar has to allow one, whichever stack the page lands on.
+                snav.navigationBar().setPrefersLargeTitles(true);
                 let arr = objc2_foundation::NSArray::from_retained_slice(&[blank_vc(mtm)]);
                 snav.setViewControllers(&arr);
                 split_vc.setViewController_forColumn(
@@ -8296,6 +8299,14 @@ mod imp {
                                 NavPatch::Presentation(_)
                                 | NavPatch::Select(_)
                                 | NavPatch::ListInStack(_) => Act::None,
+                                // Retitle the content-list page's controller — its bar names
+                                // what the list is scoped to, live (`content_list_title`).
+                                NavPatch::ListTitle(t) => state
+                                    .split
+                                    .as_ref()
+                                    .and_then(|p| p.list_vc.borrow().clone())
+                                    .map(|vc| Act::Title(vc, t.clone()))
+                                    .unwrap_or(Act::None),
                                 // Per-destination content list: a column while expanded, an
                                 // entry on the merged stack while collapsed.
                                 NavPatch::ListVisible(v) => {
@@ -8843,6 +8854,16 @@ mod imp {
             // column over (docs/navigation.md): never a member of the `vcs` mirror — while
             // collapsed the pieces layer interposes it explicitly (`NavPatch::ListInStack`).
             if page_pane == Some(day_spec::props::Pane::List) {
+                // The list's bar carries a large title (`content_list_title`: the mailbox),
+                // the way Mail's message list does at both sizes — whichever stack ends up
+                // showing the page; the pushed detail keeps the standard bar.
+                if let Some(vc) = PAGE_VCS.with(|p| p.borrow().get(&ptr_of(child)).cloned()) {
+                    unsafe {
+                        vc.navigationItem().setLargeTitleDisplayMode(
+                            objc2_ui_kit::UINavigationItemLargeTitleDisplayMode::Always,
+                        );
+                    }
+                }
                 let placed = NAV_STATE.with(|m| {
                     let mut m = m.borrow_mut();
                     let state = m.get_mut(&ptr_of(parent))?;
@@ -8855,6 +8876,7 @@ mod imp {
                     Some((snav, vc))
                 });
                 if let Some((snav, vc)) = placed {
+                    unsafe { snav.navigationBar().setPrefersLargeTitles(true) };
                     let arr = objc2_foundation::NSArray::from_retained_slice(&[vc]);
                     unsafe { snav.setViewControllers(&arr) };
                 }
